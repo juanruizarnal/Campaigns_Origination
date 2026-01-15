@@ -1,0 +1,96 @@
+[project]
+name = "alter5-origination"
+version = "0.1.0"
+description = "Motor de Automatización de Originación Alter-5"
+authors = [
+    {name = "Alter-5", email = "tech@alter-5.com"}
+]
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "Proprietary"}
+keywords = ["ai", "llm", "origination", "fintech", "b2b"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "pyairtable>=2.0.0",
+    "anthropic>=0.18.0",
+    "google-generativeai>=0.4.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "httpx>=0.26.0",
+    "tenacity>=8.0.0",
+    "typer>=0.9.0",
+    "structlog>=24.0.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "pytest-asyncio>=0.21.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+]
+
+[project.scripts]
+alter5 = "cli.main:app"
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["config*", "core*", "agents*", "integrations*", "cli*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # Pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "UP",  # pyupgrade
+]
+ignore = [
+    "E501",  # line too long (handled by formatter)
+    "B008",  # do not perform function calls in argument defaults
+]
+
+[tool.ruff.isort]
+known-first-party = ["config", "core", "agents", "integrations", "cli"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+asyncio_mode = "auto"
+addopts = "-v --cov=. --cov-report=term-missing"
+
+[tool.coverage.run]
+source = ["config", "core", "agents", "integrations", "cli"]
+omit = ["*/tests/*", "*/__init__.py"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+]
+

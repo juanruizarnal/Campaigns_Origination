@@ -1,0 +1,57 @@
+# =============================================================================
+# Motor de Originación Alter-5 - Requirements
+# =============================================================================
+# Python >= 3.11 requerido
+# Fecha: 2 Enero 2026
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# CORE: APIs de LLMs
+# -----------------------------------------------------------------------------
+anthropic==0.40.0           # Claude API - versión estable con soporte Messages API
+google-generativeai==0.8.3  # Gemini API - incluye Search Grounding
+
+# -----------------------------------------------------------------------------
+# CORE: Base de Datos y Validación
+# -----------------------------------------------------------------------------
+pyairtable==2.3.3           # Cliente Airtable oficial
+pydantic==2.10.3            # Validación de datos y modelos
+pydantic-settings==2.6.1    # Gestión de configuración desde .env
+
+# -----------------------------------------------------------------------------
+# CORE: HTTP y Resilencia
+# -----------------------------------------------------------------------------
+httpx==0.28.1               # Cliente HTTP async moderno
+tenacity==9.0.0             # Retry logic para APIs
+aiohttp==3.11.11            # Async HTTP (dependencia de google-generativeai)
+
+# -----------------------------------------------------------------------------
+# CLI y Logging
+# -----------------------------------------------------------------------------
+typer==0.9.0                # CLI framework moderno (pinned for click compatibility)
+click==8.1.7                # Command line toolkit (pinned for typer compatibility)
+rich==13.9.4                # Output enriquecido para CLI (dependencia de typer)
+structlog==24.4.0           # Logging estructurado
+
+# -----------------------------------------------------------------------------
+# Utilidades
+# -----------------------------------------------------------------------------
+python-dotenv==1.0.1        # Carga de variables de entorno
+python-dateutil==2.9.0      # Manipulación de fechas
+
+# -----------------------------------------------------------------------------
+# DESARROLLO (opcional - instalar con: pip install -r requirements-dev.txt)
+# -----------------------------------------------------------------------------
+# pytest==8.3.4
+# pytest-cov==6.0.0
+# pytest-asyncio==0.24.0
+# ruff==0.8.4
+# mypy==1.14.0
+
+# =============================================================================
+# INSTALACIÓN:
+# 1. Crear entorno virtual: python -m venv venv
+# 2. Activar entorno: source venv/bin/activate (Mac/Linux) o venv\Scripts\activate (Windows)
+# 3. Instalar: pip install -r requirements.txt
+# =============================================================================
+
