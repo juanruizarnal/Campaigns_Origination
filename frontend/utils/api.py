@@ -7,9 +7,10 @@ Uses the real Airtable field names from the schema.
 from __future__ import annotations
 
 import sys
+import re
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Optional, List, Callable, Any, TYPE_CHECKING
+from typing import Optional, List, Callable, Any
 import streamlit as st
 
 # Add parent directory to path for backend imports
@@ -30,13 +31,9 @@ try:
         FEI_STATUS_OPTIONS,
     )
     BACKEND_AVAILABLE = True
-except ImportError as e:
-    BACKEND_ERROR = str(e)
-    st.warning(f"⚠️ Backend parcialmente disponible: {e}")
-    AirtableClient = Any
-
-if TYPE_CHECKING:
-    from core.airtable_client import AirtableClient
+except Exception as e:
+    BACKEND_ERROR = f"{type(e).__name__}: {e}"
+    st.warning(f"⚠️ Backend parcialmente disponible: {BACKEND_ERROR}")
 
 
 @dataclass
@@ -316,15 +313,20 @@ class OriginationAPI:
                 candidates.append({
                     "name": getattr(candidate, "name", ""),
                     "home_url": getattr(candidate, "home_url", ""),
+                    "linkedin_url": getattr(candidate, "linkedin_url", ""),
                     "description": getattr(candidate, "description", ""),
                     "sector": getattr(candidate, "sector", ""),
                     "country": getattr(candidate, "country", ""),
+                    "hq_country": getattr(candidate, "hq_country", ""),
                     "region": getattr(candidate, "region", ""),
                     "estimated_employees": getattr(candidate, "estimated_employees", None),
+                    "employee_range": getattr(candidate, "employee_range", None),
                     "is_duplicate": getattr(candidate, "is_duplicate", False),
                     "duplicate_of": getattr(candidate, "duplicate_of", None),
                     "url_verified": getattr(candidate, "url_verified", False),
                     "created_company_id": getattr(candidate, "created_company_id", None),
+                    "match_reason": getattr(candidate, "match_reason", None),
+                    "match_confidence": getattr(candidate, "match_confidence", None),
                 })
             
             return {
@@ -368,6 +370,9 @@ class OriginationAPI:
                     
                     if candidate.get("description"):
                         company_fields["Description"] = candidate.get("description")
+
+                    if candidate.get("linkedin_url"):
+                        company_fields["Linkedin URL"] = candidate.get("linkedin_url")
                     
                     if candidate.get("estimated_employees"):
                         company_fields["Num Employees"] = candidate.get("estimated_employees")
@@ -375,6 +380,20 @@ class OriginationAPI:
                     company_record = self.airtable.create_record("companies", company_fields)
                     company_id = company_record["id"]
                     created_companies.append(company_id)
+
+                    # Update HQ Country if provided (typecast for link resolution)
+                    hq_country = candidate.get("hq_country") or candidate.get("country")
+                    if hq_country:
+                        hq_name = self._country_code_to_name(str(hq_country))
+                        try:
+                            self.airtable.update_record(
+                                "companies",
+                                company_id,
+                                {"HQ Country": [hq_name]},
+                                typecast=True,
+                            )
+                        except Exception:
+                            pass
                     
                     # Create default business unit
                     bu_fields = {
@@ -396,6 +415,26 @@ class OriginationAPI:
             }
         except Exception as e:
             return {"success": False, "errors": [str(e)]}
+
+    def _country_code_to_name(self, country_code: str) -> str:
+        """Convert ISO country code to display name for Airtable linking."""
+        mapping = {
+            "ES": "España",
+            "FR": "Francia",
+            "DE": "Alemania",
+            "IT": "Italia",
+            "PT": "Portugal",
+            "NL": "Países Bajos",
+            "BE": "Bélgica",
+            "PL": "Polonia",
+            "AT": "Austria",
+            "IE": "Irlanda",
+            "GB": "Reino Unido",
+            "UK": "Reino Unido",
+            "US": "Estados Unidos",
+        }
+        code = country_code.strip().upper()
+        return mapping.get(code, country_code)
     
     def enrich_company(
         self,
@@ -429,6 +468,113 @@ class OriginationAPI:
             return result
         except Exception as e:
             return {"success": False, "errors": [str(e)]}
+
+    def enrich_structure(self, company_id: str) -> dict:
+        """Infer parent/holding/subsidiary relationships using Airtable data."""
+        try:
+            if not self.airtable:
+                return {"success": False, "errors": ["Airtable no disponible"]}
+
+            target = self.airtable.get_record("companies", company_id)
+            fields = target.get("fields", {})
+            target_name = fields.get("Company Name", "")
+            target_url = fields.get("Home URL", "")
+            target_domain = self._normalize_domain(target_url)
+            normalized_target = self._normalize_company_name(target_name)
+
+            candidates = self.airtable.query_records("companies", max_records=2000)
+
+            parent_candidates = []
+            subsidiary_candidates = []
+            related_candidates = []
+
+            for record in candidates:
+                if record.get("id") == company_id:
+                    continue
+                other_fields = record.get("fields", {})
+                other_name = other_fields.get("Company Name", "")
+                other_url = other_fields.get("Home URL", "")
+                other_domain = self._normalize_domain(other_url)
+                normalized_other = self._normalize_company_name(other_name)
+
+                if not normalized_other:
+                    continue
+
+                similarity = self._name_similarity(normalized_target, normalized_other)
+                same_domain = target_domain and other_domain and target_domain == other_domain
+                is_group = self._looks_like_group(other_name)
+
+                if same_domain:
+                    parent_candidates.append((record, 1.0, "same_domain"))
+                    continue
+
+                if similarity >= 0.9:
+                    if normalized_target.startswith(normalized_other) and len(normalized_other) < len(normalized_target):
+                        parent_candidates.append((record, similarity, "name_contains"))
+                    elif normalized_other.startswith(normalized_target) and len(normalized_target) < len(normalized_other):
+                        subsidiary_candidates.append((record, similarity, "name_contains"))
+                    elif is_group:
+                        parent_candidates.append((record, similarity, "group_keyword"))
+                    else:
+                        related_candidates.append((record, similarity, "similar_name"))
+
+            parent = self._pick_best_relation(parent_candidates)
+            ultimate = self._pick_best_relation(
+                [c for c in parent_candidates if self._looks_like_group(c[0].get("fields", {}).get("Company Name", ""))]
+            ) or parent
+
+            update_fields = {}
+            if parent:
+                update_fields["Parent Company"] = [parent["id"]]
+            if ultimate:
+                update_fields["Ultimate Parent Company"] = [ultimate["id"]]
+            if update_fields:
+                self.airtable.update_record("companies", company_id, update_fields, typecast=True)
+
+            return {
+                "success": True,
+                "parent_company": parent.get("fields", {}).get("Company Name") if parent else None,
+                "ultimate_parent": ultimate.get("fields", {}).get("Company Name") if ultimate else None,
+                "subsidiaries": [r.get("fields", {}).get("Company Name") for r, _, _ in subsidiary_candidates][:10],
+                "related_companies": [r.get("fields", {}).get("Company Name") for r, _, _ in related_candidates][:10],
+            }
+        except Exception as e:
+            return {"success": False, "errors": [str(e)]}
+
+    def _normalize_company_name(self, name: str) -> str:
+        """Normalize company names for comparison."""
+        text = (name or "").lower()
+        text = re.sub(r"[^\w\s]", " ", text)
+        text = re.sub(r"\b(s\.a\.|s\.l\.|ltd|limited|inc|llc|gmbh|sarl|sa)\b", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    def _normalize_domain(self, url: str) -> str:
+        """Normalize a URL to its domain."""
+        try:
+            from urllib.parse import urlparse
+            if not url:
+                return ""
+            parsed = urlparse(url if url.startswith(("http://", "https://")) else f"https://{url}")
+            domain = parsed.netloc.lower()
+            return domain[4:] if domain.startswith("www.") else domain
+        except Exception:
+            return ""
+
+    def _name_similarity(self, a: str, b: str) -> float:
+        from difflib import SequenceMatcher
+        return SequenceMatcher(None, a, b).ratio()
+
+    def _looks_like_group(self, name: str) -> bool:
+        keywords = ["group", "holding", "capital", "partners", "invest", "grupo", "holdings"]
+        lowered = (name or "").lower()
+        return any(k in lowered for k in keywords)
+
+    def _pick_best_relation(self, candidates: list[tuple[dict, float, str]]) -> Optional[dict]:
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        return candidates[0][0]
     
     def get_or_create_business_units(self, company_id: str, company_name: str = None) -> dict:
         """Get existing business units for a company or create default ones.
@@ -470,6 +616,16 @@ class OriginationAPI:
                     result["created"] = 1
                 except Exception as e:
                     result["errors"] = [f"Error creando BU: {str(e)}"]
+
+            # Ensure primary BU fields are filled
+            if result.get("business_units"):
+                try:
+                    company_record = self.airtable.get_record("companies", company_id)
+                    primary_bu_id = result["business_units"][0].get("id")
+                    if primary_bu_id:
+                        self._ensure_primary_bu_fields(primary_bu_id, company_record)
+                except Exception:
+                    pass
             
             # Transform BUs to dict format
             result["business_units"] = [
@@ -535,6 +691,74 @@ class OriginationAPI:
             }
         except Exception as e:
             return {"success": False, "errors": [str(e)]}
+
+    def _ensure_primary_bu_fields(self, bu_id: str, company_record: dict) -> None:
+        """Fill required fields for the primary Business Unit."""
+        fields = company_record.get("fields", {})
+        company_name = fields.get("Company Name", "")
+        description = fields.get("Description", "") or ""
+
+        sector, activities = self._infer_sector_and_activities(company_name, description)
+        update_fields: dict[str, object] = {}
+
+        # Business Unit Type (linked) - use typecast to resolve by name
+        update_fields["Business Unit Type"] = ["Principal"]
+
+        if sector:
+            update_fields["Sector"] = [sector]
+        if activities:
+            update_fields["Activities"] = activities
+
+        hq_country = fields.get("HQ Country")
+        if isinstance(hq_country, list) and hq_country:
+            update_fields["Focus Countries"] = hq_country
+        elif isinstance(hq_country, str) and hq_country:
+            update_fields["Focus Countries"] = [self._country_code_to_name(hq_country)]
+
+        if update_fields:
+            self.airtable.update_record("business_units", bu_id, update_fields, typecast=True)
+
+    def _infer_sector_and_activities(self, company_name: str, description: str) -> tuple[str, list[str]]:
+        """Infer sector and activities for a Business Unit."""
+        text = f"{company_name} {description}".lower()
+
+        defense_keywords = ["defense", "aerospace", "military", "defence", "armament", "aircraft"]
+        real_estate_keywords = ["real estate", "property", "housing", "residential", "commercial", "developer", "inmobiliaria"]
+        renewable_keywords = ["renewable", "solar", "wind", "hydro", "hydrogen", "biomass", "geothermal", "energy"]
+
+        if any(k in text for k in defense_keywords):
+            sector = "Defense & Aerospace"
+        elif any(k in text for k in real_estate_keywords):
+            sector = "Real Estate"
+        elif any(k in text for k in renewable_keywords):
+            sector = "Renewable Energy"
+        else:
+            sector = "Renewable Energy"
+
+        activity_map = {
+            "Real Estate": [
+                "Mixed-Use Developments",
+                "Residential Development",
+                "Retail & Shopping Centers",
+                "Senior Living",
+                "Student Housing",
+            ],
+            "Renewable Energy": [
+                "Battery Storage (BESS)",
+                "Biogas",
+                "Biomass",
+                "Geothermal",
+                "Green Hydrogen Production",
+                "Hydropower",
+                "Ocean Energy",
+                "Autoconsumption",
+            ],
+            "Defense & Aerospace": [
+                "Defense & Aerospace",
+            ],
+        }
+
+        return sector, activity_map.get(sector, [])
     
     def search_contacts(self, company_id: str) -> dict:
         """Search for contacts (CEO, CFO, executives) for a company.

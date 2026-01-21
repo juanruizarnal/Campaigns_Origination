@@ -111,6 +111,7 @@ class EvaluationResult:
     evaluation_date: date = field(default_factory=date.today)
     processing_time_seconds: float = 0.0
     errors: list[str] = field(default_factory=list)
+    sources: list[str] = field(default_factory=list)
     
     # NEW: Data sources used
     data_sources: list[str] = field(default_factory=list)
@@ -336,6 +337,8 @@ class EvaluadorFEI:
                 result.scraped_data = use_scraped_data
                 result.data_sources.append("web_scraping")
                 scraped_certs = use_scraped_data.certifications
+                if use_scraped_data.url:
+                    result.sources.append(use_scraped_data.url)
                 
                 # Convert scraped certs to CertificateEvidence
                 for cert_name in scraped_certs:
@@ -360,6 +363,8 @@ class EvaluadorFEI:
                     scraped_data = await scrape_company(company_url)
                     result.scraped_data = scraped_data
                     result.data_sources.append("web_scraping")
+                    if scraped_data.url:
+                        result.sources.append(scraped_data.url)
                     
                     if scraped_data.success:
                         scraped_certs = scraped_data.certifications
@@ -395,21 +400,25 @@ class EvaluadorFEI:
             # 5. Search for additional certificates with Gemini (verification/complement)
             if not result.certificates_found:  # Only if we haven't found any yet
                 result.data_sources.append("gemini_search")
-                gemini_certs = self._search_certificates(company_name, company_url)
+                gemini_certs, cert_sources = self._search_certificates(company_name, company_url)
                 result.certificates_found.extend(gemini_certs)
+                result.sources.extend(cert_sources)
                 
-                gemini_eco_labels = self._search_eco_labels(company_name, company_url)
+                gemini_eco_labels, eco_sources = self._search_eco_labels(company_name, company_url)
                 result.certificates_found.extend(gemini_eco_labels)
+                result.sources.extend(eco_sources)
             
             # 6. Search for cleantech prizes (Criterion 1.1) - always search
-            prizes = self._search_prizes(company_name, company_url)
+            prizes, prize_sources = self._search_prizes(company_name, company_url)
             result.prizes_found = prizes
+            result.sources.extend(prize_sources)
             
             # 7. Check green business activity (Criteria 1.4 and 1.5)
-            green_activities = self._check_green_activity(
+            green_activities, green_sources = self._check_green_activity(
                 company_name, company_url, company_record
             )
             result.green_activities = green_activities
+            result.sources.extend(green_sources)
             
             # Also use scraped green indicators
             if result.scraped_data and result.scraped_data.green_indicators:
@@ -435,6 +444,12 @@ class EvaluadorFEI:
             result.confidence = evaluation["confidence"]
             result.reasoning = evaluation["reasoning"]
             result.criteria_results = evaluation.get("criteria_results", [])
+            
+            # Append sources to reasoning (literal URLs)
+            if result.sources:
+                unique_sources = list(dict.fromkeys(result.sources))
+                sources_text = "\n".join(f"- {s}" for s in unique_sources[:10])
+                result.reasoning = f"{result.reasoning}\n\nFuentes:\n{sources_text}"
             
             # 10. Save evaluation to Airtable
             if not dry_run:
@@ -474,6 +489,10 @@ class EvaluadorFEI:
         
         # Calculate processing time
         result.processing_time_seconds = (datetime.now() - start_time).total_seconds()
+
+        # Deduplicate sources
+        if result.sources:
+            result.sources = list(dict.fromkeys(result.sources))
         
         logger.info(
             "fei_evaluation_completed",
@@ -522,7 +541,7 @@ class EvaluadorFEI:
         self,
         company_name: str,
         company_url: Optional[str],
-    ) -> list[CertificateEvidence]:
+    ) -> tuple[list[CertificateEvidence], list[str]]:
         """Search for environmental certificates (Criterion 1.6).
         
         Looks for:
@@ -592,17 +611,18 @@ Only include certificates you can verify. If none found, return empty list.
                         fei_criteria="1.6_Environmental_Certificate",
                     ))
             
-            return certificates
+            sources = response.get("sources", []) if isinstance(response, dict) else []
+            return certificates, sources
             
         except (GeminiError, KeyError, TypeError) as e:
             logger.warning("certificate_search_failed", company_name=company_name, error=str(e))
-            return []
+            return [], []
     
     def _search_eco_labels(
         self,
         company_name: str,
         company_url: Optional[str],
-    ) -> list[CertificateEvidence]:
+    ) -> tuple[list[CertificateEvidence], list[str]]:
         """Search for eco-labels (Criterion 1.3).
         
         Looks for:
@@ -670,17 +690,18 @@ Only include verified eco-labels. If none found, return empty list.
                         fei_criteria="1.3_Eco_Label",
                     ))
             
-            return eco_labels
+            sources = response.get("sources", []) if isinstance(response, dict) else []
+            return eco_labels, sources
             
         except (GeminiError, KeyError, TypeError) as e:
             logger.warning("eco_label_search_failed", company_name=company_name, error=str(e))
-            return []
+            return [], []
     
     def _search_prizes(
         self,
         company_name: str,
         company_url: Optional[str],
-    ) -> list[PrizeEvidence]:
+    ) -> tuple[list[PrizeEvidence], list[str]]:
         """Search for cleantech prizes (Criterion 1.1).
         
         Looks for:
@@ -758,18 +779,19 @@ Only include prizes from {min_year} onwards. If none found, return empty list.
                         verification_url=prize_data.get("verification_url"),
                     ))
             
-            return prizes
+            sources = response.get("sources", []) if isinstance(response, dict) else []
+            return prizes, sources
             
         except (GeminiError, KeyError, TypeError) as e:
             logger.warning("prize_search_failed", company_name=company_name, error=str(e))
-            return []
+            return [], []
     
     def _check_green_activity(
         self,
         company_name: str,
         company_url: Optional[str],
         company_record: dict,
-    ) -> list[GreenActivityEvidence]:
+    ) -> tuple[list[GreenActivityEvidence], list[str]]:
         """Check for green business activity (Criteria 1.4 and 1.5).
         
         Criterion 1.4: >90% of revenue from green activities
@@ -811,7 +833,7 @@ Only include prizes from {min_year} onwards. If none found, return empty list.
                     pass
             
             if airtable_activities:
-                return airtable_activities
+                return airtable_activities, []
                 
         except Exception as e:
             logger.warning("airtable_activity_check_failed", error=str(e))
@@ -871,11 +893,12 @@ Be conservative in estimates. If unsure, use lower percentages.
                         eu_taxonomy_aligned=activity_data.get("eu_taxonomy_aligned", False),
                     ))
             
-            return activities
+            sources = response.get("sources", []) if isinstance(response, dict) else []
+            return activities, sources
             
         except (GeminiError, KeyError, TypeError) as e:
             logger.warning("green_activity_check_failed", company_name=company_name, error=str(e))
-            return []
+            return [], []
     
     def _evaluate_with_reasoning(
         self,

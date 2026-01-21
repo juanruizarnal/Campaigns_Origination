@@ -249,10 +249,13 @@ class GeminiClient:
                 candidate = response.candidates[0]
                 if hasattr(candidate, 'grounding_metadata'):
                     grounding_metadata = candidate.grounding_metadata
+
+            sources = self._extract_grounding_sources(grounding_metadata)
             
             result = {
                 "response": response_text,
                 "grounding_metadata": grounding_metadata,
+                "sources": sources,
             }
             
             logger.info(
@@ -270,6 +273,43 @@ class GeminiClient:
                 error_message=str(e),
             )
             raise GeminiError(f"Gemini search failed: {e}") from e
+
+    def _extract_grounding_sources(self, grounding_metadata) -> list[str]:
+        """Extract source URLs from Gemini grounding metadata."""
+        if not grounding_metadata:
+            return []
+
+        sources: list[str] = []
+
+        try:
+            # Handle dict-like metadata
+            if isinstance(grounding_metadata, dict):
+                chunks = grounding_metadata.get("grounding_chunks") or grounding_metadata.get("chunks") or []
+            else:
+                chunks = getattr(grounding_metadata, "grounding_chunks", None) or []
+
+            for chunk in chunks:
+                web = getattr(chunk, "web", None) if not isinstance(chunk, dict) else chunk.get("web")
+                if isinstance(web, dict):
+                    uri = web.get("uri") or web.get("url")
+                else:
+                    uri = getattr(web, "uri", None) or getattr(web, "url", None)
+                if uri:
+                    sources.append(uri)
+
+            # Fallback: try citation metadata if present
+            if not sources:
+                citation_meta = getattr(grounding_metadata, "citation_metadata", None)
+                if citation_meta and hasattr(citation_meta, "citations"):
+                    for citation in citation_meta.citations:
+                        uri = getattr(citation, "uri", None)
+                        if uri:
+                            sources.append(uri)
+        except Exception:
+            return []
+
+        # Deduplicate while preserving order
+        return list(dict.fromkeys(sources))
     
     def generate_json(
         self,

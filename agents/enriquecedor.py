@@ -21,6 +21,7 @@ Usage:
 """
 
 import asyncio
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, Optional
@@ -42,6 +43,7 @@ from core.models import (
     Contact,
     KeyPerson,
     ScrapedCompanyData,
+    ScrapedContact,
     LinkedInCompanyData,
     LinkedInPersonData,
 )
@@ -408,12 +410,12 @@ class EnriquecedorDatos:
             
             # 5. Search for financial data
             if include_financials:
-                financial_info = self._extract_financials(company_name, company_url)
+                financial_info = self._extract_financials(company_name, company_url, result.scraped_data)
                 result.financial_info = financial_info
             
             # 6. Search for key persons
             if include_contacts:
-                key_persons = self._identify_key_persons(company_name, company_url)
+                key_persons = self._identify_key_persons(company_name, company_url, result.scraped_data)
                 result.key_persons = key_persons
             
             # 7. Save results to Airtable
@@ -560,6 +562,7 @@ CRÍTICO: Solo incluye datos que puedas verificar. Es mejor null que un dato inv
         self,
         company_name: str,
         company_url: Optional[str],
+        scraped_data: Optional[ScrapedCompanyData] = None,
     ) -> FinancialInfo:
         """Search for company financial information.
         
@@ -613,6 +616,12 @@ REGLAS CRÍTICAS:
 - Preferir datos más recientes
 """
         
+        # Try to extract from scraped website mentions first (avoid paid APIs)
+        if scraped_data and scraped_data.revenue_mentions:
+            scraped_financials = self._extract_financials_from_scrape(scraped_data)
+            if scraped_financials and scraped_financials.has_data():
+                return scraped_financials
+
         try:
             response = self._gemini.search_and_generate(
                 query=query,
@@ -660,11 +669,62 @@ REGLAS CRÍTICAS:
                 error=str(e),
             )
             return FinancialInfo()
+
+    def _extract_financials_from_scrape(self, scraped_data: ScrapedCompanyData) -> FinancialInfo:
+        """Extract financials from scraped revenue mentions."""
+        if not scraped_data or not scraped_data.revenue_mentions:
+            return FinancialInfo()
+
+        best_revenue = None
+        for mention in scraped_data.revenue_mentions:
+            amount = self._parse_financial_amount(mention)
+            if amount and (best_revenue is None or amount > best_revenue):
+                best_revenue = amount
+
+        if best_revenue is None:
+            return FinancialInfo()
+
+        return FinancialInfo(
+            annual_revenues=best_revenue,
+            currency="EUR",
+            source="Website",
+        )
+
+    def _parse_financial_amount(self, text: str) -> Optional[float]:
+        """Parse a numeric amount from text like '50M€' or '50 millones'."""
+        if not text:
+            return None
+
+        raw = text.lower().replace("€", "").replace("$", "").replace("eur", "").strip()
+        match = re.search(r"(\d+(?:[.,]\d+)?)\s*(k|m|b|bn|million|millones|millon|billion)?", raw)
+        if not match:
+            return None
+
+        value_str = match.group(1).replace(",", ".")
+        try:
+            value = float(value_str)
+        except ValueError:
+            return None
+
+        multiplier = match.group(2) or ""
+        if multiplier in {"k"}:
+            value *= 1_000
+        elif multiplier in {"m", "million", "millones", "millon"}:
+            value *= 1_000_000
+        elif multiplier in {"b", "bn", "billion"}:
+            value *= 1_000_000_000
+
+        # Ignore tiny values that look like counts, not revenues
+        if value < 10_000:
+            return None
+
+        return value
     
     def _identify_key_persons(
         self,
         company_name: str,
         company_url: Optional[str],
+        scraped_data: Optional[ScrapedCompanyData] = None,
     ) -> list[KeyPersonInfo]:
         """Identify key persons (executives) at the company.
         
@@ -680,6 +740,12 @@ REGLAS CRÍTICAS:
             company_name=company_name,
         )
         
+        # Prefer contacts extracted from the website (free, verifiable)
+        if scraped_data and scraped_data.contacts:
+            contacts = self._select_key_contacts_from_scrape(scraped_data.contacts)
+            if contacts:
+                return contacts
+
         query = f"""
 Busca los ejecutivos clave REALES de la empresa "{company_name}".
 {f'Sitio web: {company_url}' if company_url else ''}
@@ -763,6 +829,48 @@ REGLAS CRÍTICAS:
                 error=str(e),
             )
             return []
+
+    def _select_key_contacts_from_scrape(self, contacts: list[ScrapedContact]) -> list[KeyPersonInfo]:
+        """Filter and normalize key contacts from scraped website data."""
+        if not contacts:
+            return []
+
+        role_keywords = [
+            "ceo", "cfo", "coo", "cto", "chief", "director", "president",
+            "managing", "partner", "founder", "gerente", "consejero", "executive",
+        ]
+
+        key_people: list[KeyPersonInfo] = []
+        for contact in contacts:
+            role = (contact.role or "").lower()
+            if role and not any(k in role for k in role_keywords):
+                continue
+
+            first_name, last_name = self._split_name(contact.name or "")
+            if not first_name and not contact.email:
+                continue
+
+            key_people.append(KeyPersonInfo(
+                first_name=first_name or "N/A",
+                last_name=last_name or "",
+                role=contact.role or "Executive",
+                email=contact.email,
+                phone=contact.phone,
+                linkedin_url=contact.linkedin_url,
+                is_key_person=True,
+            ))
+
+        return key_people[:5]
+
+    def _split_name(self, full_name: str) -> tuple[str, str]:
+        """Split a full name into first and last name parts."""
+        name = (full_name or "").strip()
+        if not name:
+            return "", ""
+        parts = name.split()
+        if len(parts) == 1:
+            return parts[0], ""
+        return parts[0], " ".join(parts[1:])
     
     def _save_results(
         self,
@@ -790,8 +898,23 @@ REGLAS CRÍTICAS:
             # Only update fields that are currently empty in Airtable
             existing_fields = company_record.get("fields", {})
             
-            if company_info.num_employees and not existing_fields.get("Num Employees"):
-                update_fields["Num Employees"] = company_info.num_employees
+            if company_info.num_employees:
+                existing_employees = existing_fields.get("Num Employees")
+                strong_source = "linkedin" in result.data_sources or "web_scraping" in result.data_sources
+                should_update = not existing_employees
+                if existing_employees and strong_source:
+                    try:
+                        existing_val = float(existing_employees)
+                        new_val = float(company_info.num_employees)
+                        if existing_val == 0:
+                            should_update = True
+                        else:
+                            delta = abs(new_val - existing_val) / max(existing_val, 1)
+                            should_update = delta >= 0.25
+                    except Exception:
+                        should_update = True
+                if should_update:
+                    update_fields["Num Employees"] = company_info.num_employees
             
             if company_info.linkedin_url and not existing_fields.get("Linkedin URL"):
                 update_fields["Linkedin URL"] = company_info.linkedin_url
@@ -832,30 +955,38 @@ REGLAS CRÍTICAS:
         
         # 2. Create financials record if we have data
         if financial_info and financial_info.has_data():
-            try:
-                financial_fields = {
-                    "Company": [company_id],  # Link field
-                }
-                
-                if financial_info.year:
-                    financial_fields["Year"] = str(financial_info.year)
-                if financial_info.annual_revenues:
-                    financial_fields["Annual_Revenues"] = financial_info.annual_revenues
-                if financial_info.ebitda:
-                    financial_fields["EBITDA"] = financial_info.ebitda
-                if financial_info.net_financial_debt:
-                    financial_fields["Net_Financial_Debt"] = financial_info.net_financial_debt
-                
-                self._airtable.create_record("financials", financial_fields)
-                result.financials_created = True
-                
-                logger.info(
-                    "financials_record_created",
-                    company_id=company_id,
-                    year=financial_info.year,
-                )
-            except AirtableError as e:
-                result.errors.append(f"Failed to create financials: {e}")
+            existing_fields = company_record.get("fields", {})
+            existing_revenues = existing_fields.get("Revenues")
+            existing_ebitda = existing_fields.get("EBITDA")
+            if isinstance(existing_revenues, list):
+                existing_revenues = existing_revenues[0] if existing_revenues else None
+            if isinstance(existing_ebitda, list):
+                existing_ebitda = existing_ebitda[0] if existing_ebitda else None
+            if not (existing_revenues or existing_ebitda):
+                try:
+                    financial_fields = {
+                        "Company": [company_id],  # Link field
+                    }
+
+                    if financial_info.year:
+                        financial_fields["Year"] = str(financial_info.year)
+                    if financial_info.annual_revenues:
+                        financial_fields["Annual_Revenues"] = financial_info.annual_revenues
+                    if financial_info.ebitda:
+                        financial_fields["EBITDA"] = financial_info.ebitda
+                    if financial_info.net_financial_debt:
+                        financial_fields["Net_Financial_Debt"] = financial_info.net_financial_debt
+
+                    self._airtable.create_record("financials", financial_fields)
+                    result.financials_created = True
+
+                    logger.info(
+                        "financials_record_created",
+                        company_id=company_id,
+                        year=financial_info.year,
+                    )
+                except AirtableError as e:
+                    result.errors.append(f"Failed to create financials: {e}")
         
         # 3. Create contact records for key persons
         # First, get or create a business unit for the contacts

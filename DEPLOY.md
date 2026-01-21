@@ -5,11 +5,12 @@
 1. [Requisitos Previos](#requisitos-previos)
 2. [Configuración Local](#configuración-local)
 3. [Pruebas Pre-Deploy](#pruebas-pre-deploy)
-4. [Deploy en Railway (Recomendado)](#deploy-en-railway-recomendado)
-5. [Deploy en Render](#deploy-en-render)
-6. [Deploy en Fly.io](#deploy-en-flyio)
-7. [Verificación Post-Deploy](#verificación-post-deploy)
-8. [Troubleshooting](#troubleshooting)
+4. [Deploy en Streamlit Cloud](#deploy-en-streamlit-cloud)
+5. [Deploy en Railway (Recomendado)](#deploy-en-railway-recomendado)
+6. [Deploy en Render](#deploy-en-render)
+7. [Deploy en Fly.io](#deploy-en-flyio)
+8. [Verificación Post-Deploy](#verificación-post-deploy)
+9. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -147,6 +148,44 @@ agent = EvaluadorFEI()
 print('EvaluadorFEI OK')
 "
 ```
+
+---
+
+## Deploy en Streamlit Cloud
+
+Streamlit Cloud es la opción más rápida para publicar solo el frontend.
+
+### 1. Preparar el repositorio
+
+- La rama principal debe ser `main`
+- El archivo principal es `frontend/app.py`
+- La configuración de tema vive en `.streamlit/config.toml`
+
+### 2. Crear la app en Streamlit Cloud
+
+1. Ve a https://share.streamlit.io/
+2. Conecta tu cuenta de GitHub si no lo has hecho
+3. Selecciona el repo `juanruizarnal/OriginationEngineV1`
+4. En **Branch** selecciona `main`
+5. En **Main file path** escribe `frontend/app.py`
+6. Pulsa **Deploy**
+
+### 3. Configurar secrets (obligatorio)
+
+En **App settings → Secrets**, pega este bloque y reemplaza valores:
+
+```toml
+ANTHROPIC_API_KEY = "sk-ant-..."
+GOOGLE_API_KEY = "AIza..."
+AIRTABLE_PAT = "pat..."
+AIRTABLE_BASE_ID = "appEgNSP0tOLJ9YJ9"
+```
+
+### 4. Validación rápida
+
+1. Abre la URL de la app
+2. Verifica que cargue el dashboard sin errores
+3. Prueba una consulta simple en "Empresas"
 
 ---
 

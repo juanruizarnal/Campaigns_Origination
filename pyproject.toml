@@ -30,7 +30,7 @@ dependencies = [
 
     # Core - HTTP y Resilencia
     "httpx>=0.28.1",               # Cliente HTTP async moderno
-    "tenacity>=9.0.0",             # Retry logic para APIs
+    "tenacity>=8.1.0,<9",          # Retry logic para APIs (compatible con Streamlit 1.31)
     "aiohttp>=3.11.11",            # Async HTTP (dependencia de google-generativeai)
 
     # Frontend - Streamlit

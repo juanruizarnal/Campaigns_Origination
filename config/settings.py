@@ -5,10 +5,43 @@ Origination Engine, loading settings from environment variables and .env files.
 """
 
 from functools import lru_cache
+import os
+from pathlib import Path
 from typing import Literal
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _load_streamlit_secrets() -> None:
+    """Load Streamlit Cloud secrets into environment variables when available."""
+    try:
+        import tomllib
+    except Exception:
+        return
+
+    secrets_path = Path(__file__).resolve().parent.parent / ".streamlit" / "secrets.toml"
+    if not secrets_path.exists():
+        return
+
+    try:
+        with secrets_path.open("rb") as handle:
+            secrets = tomllib.load(handle)
+    except Exception:
+        return
+
+    def inject(payload: dict) -> None:
+        for key, value in payload.items():
+            if isinstance(value, dict):
+                inject(value)
+                continue
+            if isinstance(value, (str, int, float, bool)) and key not in os.environ:
+                os.environ[key] = str(value)
+
+    inject(secrets)
+
+
+_load_streamlit_secrets()
 
 
 class Settings(BaseSettings):

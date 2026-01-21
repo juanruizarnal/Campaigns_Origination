@@ -38,8 +38,10 @@ from config.settings import get_settings
 from config.airtable_schema import TABLES, COMPANY_FIELDS, BUSINESS_UNIT_FIELDS
 from config.prompts import load_prompt
 from core.airtable_client import AirtableClient, AirtableError, get_airtable_client
+from core.async_utils import gather_with_concurrency, run_async
 from core.models import Company
 from integrations.gemini import GeminiClient, GeminiError, get_gemini_client
+from integrations.scraper import scrape_company
 
 logger = structlog.get_logger()
 settings = get_settings()
@@ -134,14 +136,19 @@ class CompanyCandidate:
     """A candidate company found during search."""
     name: str
     home_url: Optional[str] = None
+    linkedin_url: Optional[str] = None
     description: Optional[str] = None
     sector: Optional[str] = None
     country: Optional[str] = None
+    hq_country: Optional[str] = None
     region: Optional[str] = None
     estimated_employees: Optional[int] = None
+    employee_range: Optional[str] = None
     url_verified: bool = False
     is_duplicate: bool = False
     duplicate_of: Optional[str] = None
+    match_reason: Optional[str] = None
+    match_confidence: Optional[float] = None
     created_company_id: Optional[str] = None
     created_bu_id: Optional[str] = None
     
@@ -331,6 +338,9 @@ class BuscadorEmpresas:
                     task_id=task_id,
                     verified=result.candidates_verified,
                 )
+                
+                # Step 2b: Enrich from scraping (description, LinkedIn, employees, HQ)
+                self._enrich_candidates_with_scraping(candidates)
             else:
                 # Mark all as verified if skipping
                 for c in candidates:
@@ -517,11 +527,14 @@ Para cada empresa encontrada, proporciona la información en formato JSON:
         {{
             "name": "Nombre exacto de la empresa",
             "home_url": "https://www.ejemplo.com",
+                    "linkedin_url": "https://www.linkedin.com/company/...",
             "description": "Breve descripción de la actividad",
             "sector": "Sector de actividad",
             "country": "Código de país ISO (ES, IE, PT, DE, etc.)",
+                    "hq_country": "Código de país ISO (ES, IE, PT, DE, etc.)",
             "region": "Región o ciudad",
-            "estimated_employees": 100
+                    "estimated_employees": 100,
+                    "employee_range": "50-200"
         }}
     ]
 }}
@@ -529,6 +542,7 @@ Para cada empresa encontrada, proporciona la información en formato JSON:
 REGLAS:
 - Solo empresas REALES con sitio web verificable
 - La URL debe ser la página principal de la empresa
+        - Incluye LinkedIn si lo encuentras en fuentes oficiales
 - NO inventar empresas ni URLs
 - Incluir las {limit} empresas más relevantes del sector
 - El código de país DEBE coincidir con el país solicitado
@@ -557,11 +571,14 @@ Return ONLY valid JSON in this exact format:
         {{
             "name": "Company Name",
             "home_url": "https://...",
+                    "linkedin_url": "https://...",
             "description": "...",
             "sector": "...",
             "country": "ES",
+                    "hq_country": "ES",
             "region": "...",
-            "estimated_employees": 50
+                    "estimated_employees": 50,
+                    "employee_range": "50-200"
         }}
     ]
 }}
@@ -575,11 +592,14 @@ Return ONLY valid JSON in this exact format:
                 candidate = CompanyCandidate(
                     name=company_data.get("name", "Unknown"),
                     home_url=company_data.get("home_url"),
+                    linkedin_url=company_data.get("linkedin_url"),
                     description=company_data.get("description"),
                     sector=company_data.get("sector"),
                     country=company_data.get("country"),
+                    hq_country=company_data.get("hq_country"),
                     region=company_data.get("region"),
                     estimated_employees=company_data.get("estimated_employees"),
+                    employee_range=company_data.get("employee_range"),
                 )
                 candidates.append(candidate)
             
@@ -620,6 +640,37 @@ Return ONLY valid JSON in this exact format:
                 candidate.home_url = resolved_url
             else:
                 candidate.url_verified = False
+
+    def _enrich_candidates_with_scraping(self, candidates: list[CompanyCandidate]) -> None:
+        """Enrich candidates by scraping their official websites."""
+        async def enrich_candidate(candidate: CompanyCandidate):
+            if not candidate.url_verified or not candidate.home_url:
+                return
+            scraped = await scrape_company(candidate.home_url)
+            if not scraped or not scraped.success:
+                return
+
+            if scraped.description and not candidate.description:
+                candidate.description = scraped.description
+            if scraped.linkedin_url and not candidate.linkedin_url:
+                candidate.linkedin_url = scraped.linkedin_url
+            if scraped.employee_count:
+                candidate.estimated_employees = scraped.employee_count
+            if scraped.employee_range and not candidate.employee_range:
+                candidate.employee_range = scraped.employee_range
+
+            inferred_country = self._infer_country_from_text(
+                scraped.main_text or "",
+                candidate.home_url,
+            )
+            if inferred_country and not candidate.hq_country:
+                candidate.hq_country = inferred_country
+            if not candidate.hq_country and candidate.country:
+                candidate.hq_country = candidate.country
+
+        coros = [enrich_candidate(c) for c in candidates]
+        if coros:
+            run_async(gather_with_concurrency(3, *coros))
 
     def _normalize_url(self, url: Optional[str]) -> Optional[str]:
         """Normalize a URL string for verification."""
@@ -796,12 +847,16 @@ Return ONLY valid JSON in this exact format:
             if candidate_name in existing_names:
                 candidate.is_duplicate = True
                 candidate.duplicate_of = existing_names[candidate_name]
+                candidate.match_reason = "exact_name"
+                candidate.match_confidence = 1.0
                 continue
             
             # Check domain match
             if candidate_domain and candidate_domain in existing_domains:
                 candidate.is_duplicate = True
                 candidate.duplicate_of = existing_domains[candidate_domain]
+                candidate.match_reason = "same_domain"
+                candidate.match_confidence = 1.0
                 continue
             
             # Check name similarity
@@ -810,7 +865,57 @@ Return ONLY valid JSON in this exact format:
                 if similarity >= SIMILARITY_THRESHOLD:
                     candidate.is_duplicate = True
                     candidate.duplicate_of = company_id
+                    candidate.match_reason = "high_name_similarity"
+                    candidate.match_confidence = similarity
                     break
+
+    def _infer_country_from_text(self, text: str, url: Optional[str] = None) -> Optional[str]:
+        """Infer HQ country from website text or TLD."""
+        tld_map = {
+            ".es": "ES",
+            ".fr": "FR",
+            ".de": "DE",
+            ".it": "IT",
+            ".pt": "PT",
+            ".nl": "NL",
+            ".be": "BE",
+            ".pl": "PL",
+            ".at": "AT",
+            ".ie": "IE",
+        }
+        if url:
+            parsed = urlparse(url)
+            for tld, code in tld_map.items():
+                if parsed.netloc.endswith(tld):
+                    return code
+
+        if not text:
+            return None
+
+        country_names = {
+            "ES": ["españa", "spain"],
+            "FR": ["francia", "france"],
+            "DE": ["alemania", "germany", "deutschland"],
+            "IT": ["italia", "italy"],
+            "PT": ["portugal"],
+            "NL": ["países bajos", "netherlands", "holland"],
+            "BE": ["bélgica", "belgium"],
+            "PL": ["polonia", "poland"],
+            "AT": ["austria"],
+            "IE": ["irlanda", "ireland"],
+        }
+
+        lowered = text.lower()
+        for code, names in country_names.items():
+            for name in names:
+                if re.search(rf"(headquartered|sede|based|head office|oficina central).*{name}", lowered):
+                    return code
+
+        for code, names in country_names.items():
+            if any(name in lowered for name in names):
+                return code
+
+        return None
     
     def _extract_domain(self, url: str) -> Optional[str]:
         """Extract domain from URL.
@@ -850,6 +955,9 @@ Return ONLY valid JSON in this exact format:
         
         if candidate.home_url:
             company_fields["Home URL"] = candidate.home_url
+
+        if candidate.linkedin_url:
+            company_fields["Linkedin URL"] = candidate.linkedin_url
         
         if candidate.description:
             company_fields["Description"] = candidate.description
@@ -860,6 +968,18 @@ Return ONLY valid JSON in this exact format:
         
         company_record = self._airtable.create_record("companies", company_fields)
         company_id = company_record["id"]
+
+        # Update HQ Country if available (typecast to resolve links)
+        if candidate.hq_country:
+            try:
+                self._airtable.update_record(
+                    "companies",
+                    company_id,
+                    {"HQ Country": [candidate.hq_country]},
+                    typecast=True,
+                )
+            except AirtableError:
+                pass
         
         # Create default Business Unit
         # NOTE: Sector and Focus Countries are Link fields (would need record IDs)

@@ -108,25 +108,51 @@ def similar(a: str, b: str) -> float:
     b_clean = b.lower().strip()
     return SequenceMatcher(None, a_clean, b_clean).ratio()
 
+def normalize_domain(url: str) -> str:
+    """Normalize a URL to compare domains."""
+    if not url:
+        return ""
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url if url.startswith(("http://", "https://")) else f"https://{url}")
+        domain = parsed.netloc.lower()
+        return domain[4:] if domain.startswith("www.") else domain
+    except Exception:
+        return ""
 
-def find_similar_company(name: str, airtable_companies: list, threshold: float = 0.85) -> dict | None:
-    """Find a similar company in Airtable by name."""
-    if not name or not airtable_companies:
-        return None
-    
+
+def match_airtable_company(candidate: dict, airtable_companies: list, threshold: float = 0.9) -> tuple[dict | None, str | None, float | None]:
+    """Match candidate with Airtable company using URL or name similarity."""
+    if not candidate or not airtable_companies:
+        return None, None, None
+
+    name = candidate.get("name", candidate.get("Company Name", ""))
+    url = candidate.get("home_url", candidate.get("Home URL", ""))
+    candidate_domain = normalize_domain(url)
+
     best_match = None
     best_ratio = 0.0
-    
+    best_reason = None
+
     for company in airtable_companies:
         fields = company.get("fields", {})
         airtable_name = fields.get("Company Name", "")
-        
+        airtable_url = fields.get("Home URL", "")
+        airtable_domain = normalize_domain(airtable_url)
+
+        if candidate_domain and airtable_domain and candidate_domain == airtable_domain:
+            return company, "same_domain", 1.0
+
         ratio = similar(name, airtable_name)
-        if ratio > best_ratio and ratio >= threshold:
+        if ratio > best_ratio:
             best_ratio = ratio
             best_match = company
-    
-    return best_match
+            best_reason = "high_name_similarity"
+
+    if best_match and best_ratio >= threshold:
+        return best_match, best_reason, best_ratio
+
+    return None, None, None
 
 
 def candidate_key(company: dict) -> str:
@@ -359,7 +385,7 @@ def display_company_card(
     fei_status = fields.get("FEI_Status", "Unknown") or "Unknown"
     
     # Get country
-    country = fields.get("HQ Country", fields.get("country", ""))
+    country = fields.get("HQ Country", fields.get("hq_country", fields.get("country", "")))
     if isinstance(country, list):
         country = country[0] if country else ""
     country_str = country if country else "N/A"
@@ -395,17 +421,17 @@ def display_company_card(
         # For search results, show explicit status
         if is_search_result:
             is_in_airtable = company.get("_is_in_airtable", False)
+            match_reason = company.get("_match_reason")
+            match_confidence = company.get("_match_confidence")
             if is_in_airtable and airtable_match:
-                # Exact or very close match found
                 airtable_icon = "✅"
-                airtable_status = "En Airtable"
+                airtable_status = "En Airtable (URL igual)"
             elif airtable_match:
-                # Similar company found
                 airtable_icon = "⚠️"
                 match_name = airtable_match.get("fields", {}).get("Company Name", "")
-                airtable_status = f"Similar: '{truncate_text(match_name, 25)}'"
+                conf = f"{match_confidence*100:.0f}%" if match_confidence else "alta"
+                airtable_status = f"Similar ({conf}): '{truncate_text(match_name, 25)}'"
             else:
-                # New company
                 airtable_icon = "🆕"
                 airtable_status = "Nueva"
             status_indicator = f"{airtable_icon} {airtable_status}"
@@ -475,8 +501,9 @@ def display_company_card(
                 if isinstance(match_country, list):
                     match_country = match_country[0] if match_country else ""
                 
+                reason = company.get("_match_reason") or "similaridad"
                 st.warning(f"""
-                ⚠️ **Posible duplicado detectado:**  
+                ⚠️ **Posible duplicado detectado ({reason}):**  
                 Empresa en Airtable: **"{match_fields.get('Company Name', 'N/A')}"** ({match_country or 'País desconocido'})  
                 Revisa antes de guardar. Si es la misma empresa en diferente país/actividad, se puede crear una Business Unit.
                 """)
@@ -648,9 +675,11 @@ with tab1:
                                     for existing in all_results
                                 )
                                 if not is_dup:
-                                    airtable_match = find_similar_company(c_name, airtable_companies)
+                                    airtable_match, match_reason, match_confidence = match_airtable_company(c, airtable_companies)
                                     c["_airtable_match"] = airtable_match
-                                    c["_is_in_airtable"] = airtable_match is not None
+                                    c["_match_reason"] = match_reason
+                                    c["_match_confidence"] = match_confidence
+                                    c["_is_in_airtable"] = match_reason == "same_domain"
                                     all_results.append(c)
                 
                 all_results = all_results[:max_companies]
@@ -1232,18 +1261,12 @@ with tab1:
                     }
 
                     try:
-                        structure_result = api.enrich_company(
-                            company_id,
-                            company_name=company_name,
-                            company_url=company_url,
-                            include_financials=False,
-                            include_contacts=False,
-                        )
-
-                        if hasattr(structure_result, "company_info") and structure_result.company_info:
-                            result_entry["success"] = True
-                        elif isinstance(structure_result, dict):
+                        structure_result = api.enrich_structure(company_id)
+                        if isinstance(structure_result, dict):
                             result_entry["success"] = structure_result.get("success", False)
+                            result_entry["parent_company"] = structure_result.get("parent_company")
+                            result_entry["ultimate_parent"] = structure_result.get("ultimate_parent")
+                            result_entry["subsidiaries"] = structure_result.get("subsidiaries", [])
                             if not result_entry["success"]:
                                 result_entry["error"] = str(structure_result.get("errors", []))
                         else:
@@ -1783,22 +1806,10 @@ with tab2:
                 }
                 
                 try:
-                    # Call enrichment to get structure info
-                    structure_result = api.enrich_company(
-                        company_id,
-                        company_name=company_name,
-                        company_url=company_url,
-                        include_financials=True,
-                        include_contacts=False
-                    )
-                    
-                    if hasattr(structure_result, "company_info") and structure_result.company_info:
-                        info = structure_result.company_info
-                        result_entry["parent_company"] = getattr(info, "parent_company", None)
-                        result_entry["subsidiaries"] = getattr(info, "subsidiaries", [])
-                        result_entry["success"] = True
-                    elif isinstance(structure_result, dict):
+                    structure_result = api.enrich_structure(company_id)
+                    if isinstance(structure_result, dict):
                         result_entry["parent_company"] = structure_result.get("parent_company")
+                        result_entry["ultimate_parent"] = structure_result.get("ultimate_parent")
                         result_entry["subsidiaries"] = structure_result.get("subsidiaries", [])
                         result_entry["success"] = structure_result.get("success", False)
                     
@@ -1986,6 +1997,9 @@ with tab2:
                             st.markdown(f"🏛️ **Empresa Matriz:** {r['parent_company']}")
                         else:
                             st.markdown("🏛️ **Empresa Matriz:** No identificada")
+
+                        if r.get("ultimate_parent"):
+                            st.markdown(f"🏢 **Holding/Grupo:** {r['ultimate_parent']}")
                         
                         subs = r.get("subsidiaries", [])
                         if subs:

@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import Optional
 from urllib.parse import urljoin, urlparse
 
+import httpx
 import structlog
 from tenacity import retry, stop_after_attempt, wait_exponential
 
@@ -118,12 +119,29 @@ class PlaywrightScraper:
     
     async def __aenter__(self):
         """Async context manager entry."""
-        from playwright.async_api import async_playwright
-        self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox"],
-        )
+        try:
+            from playwright.async_api import async_playwright
+        except Exception as e:
+            logger.warning("playwright_unavailable", error=str(e))
+            self._playwright = None
+            self._browser = None
+            return self
+
+        try:
+            self._playwright = await async_playwright().start()
+            self._browser = await self._playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox"],
+            )
+        except Exception as e:
+            logger.warning("playwright_launch_failed", error=str(e))
+            if self._playwright:
+                try:
+                    await self._playwright.stop()
+                except Exception:
+                    pass
+            self._playwright = None
+            self._browser = None
         return self
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -156,6 +174,9 @@ class PlaywrightScraper:
         # Ensure URL has scheme
         if not url.startswith(("http://", "https://")):
             url = f"https://{url}"
+
+        if not self._browser:
+            return await self._scrape_with_httpx(url, follow_links=follow_links)
         
         try:
             # Create browser context with custom user agent
@@ -234,6 +255,56 @@ class PlaywrightScraper:
                 success=False,
                 error_message=str(e),
             )
+
+    async def _scrape_with_httpx(
+        self,
+        url: str,
+        follow_links: bool = True,
+    ) -> ScrapedCompanyData:
+        """Fallback scraper using HTTP requests when Playwright is unavailable."""
+        logger.info("scraping_fallback_httpx", url=url)
+        try:
+            timeout = max(5, self._timeout / 1000)
+            async with httpx.AsyncClient(
+                headers={"User-Agent": self._user_agent},
+                timeout=timeout,
+                follow_redirects=True,
+            ) as client:
+                response = await client.get(url)
+                response.raise_for_status()
+                html = response.text
+
+            main_text = await self._extract_clean_text(html)
+
+            result = ScrapedCompanyData(
+                url=url,
+                scraped_at=datetime.now(),
+                success=True,
+            )
+
+            result.certifications = self._extract_certifications(html, main_text)
+            result.green_indicators = self._extract_green_indicators(main_text)
+            result.description = self._extract_meta_description(html)
+            result.activities = self._extract_activities(main_text)
+            result.linkedin_url = self._extract_linkedin_from_html(html)
+            result.twitter_url = self._extract_twitter_from_html(html)
+            result.employee_count, result.employee_range = self._extract_employee_info(main_text)
+            result.revenue_mentions = self._extract_revenue_mentions(main_text)
+            result.main_text = main_text[:10000] if main_text else None
+
+            result.certifications = list(set(result.certifications))
+            result.green_indicators = list(set(result.green_indicators))
+
+            return result
+
+        except Exception as e:
+            logger.error("scraping_fallback_failed", url=url, error=str(e))
+            return ScrapedCompanyData(
+                url=url,
+                scraped_at=datetime.now(),
+                success=False,
+                error_message=str(e),
+            )
     
     async def _extract_clean_text(self, html: str) -> str:
         """Extract clean text from HTML using trafilatura."""
@@ -269,6 +340,25 @@ class PlaywrightScraper:
             return None
         except Exception:
             return None
+
+    def _extract_meta_description(self, html: str) -> Optional[str]:
+        """Extract description from meta tags in raw HTML."""
+        try:
+            from bs4 import BeautifulSoup
+        except Exception:
+            return None
+
+        try:
+            soup = BeautifulSoup(html, "lxml")
+            meta = soup.find("meta", attrs={"name": "description"})
+            if meta and meta.get("content"):
+                return meta.get("content")
+            og_meta = soup.find("meta", attrs={"property": "og:description"})
+            if og_meta and og_meta.get("content"):
+                return og_meta.get("content")
+        except Exception:
+            return None
+        return None
     
     async def _extract_linkedin(self, page) -> Optional[str]:
         """Extract LinkedIn URL from page."""
@@ -303,6 +393,22 @@ class PlaywrightScraper:
             return None
         except Exception:
             return None
+
+    def _extract_linkedin_from_html(self, html: str) -> Optional[str]:
+        """Extract LinkedIn URL from raw HTML."""
+        match = re.search(
+            r"https?://(?:www\.)?linkedin\.com/(company|in)/[A-Za-z0-9\-_/]+",
+            html,
+        )
+        return match.group(0) if match else None
+
+    def _extract_twitter_from_html(self, html: str) -> Optional[str]:
+        """Extract Twitter/X URL from raw HTML."""
+        match = re.search(
+            r"https?://(?:www\.)?(twitter|x)\.com/[A-Za-z0-9_]+",
+            html,
+        )
+        return match.group(0) if match else None
     
     def _extract_certifications(self, html: str, text: str) -> list[str]:
         """Extract certifications from HTML and text."""
