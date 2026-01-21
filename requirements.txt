@@ -74,7 +74,7 @@ pandas>=2.0.0               # Data manipulation (usado por Streamlit)
 # -----------------------------------------------------------------------------
 typer>=0.9.0                # CLI framework moderno
 click>=8.1.7                # Command line toolkit (pinned for typer compatibility)
-rich>=13.9.4                # Output enriquecido para CLI
+rich>=13.9.4,<14            # Output enriquecido para CLI (compat con Streamlit)
 structlog>=24.4.0           # Logging estructurado
 
 # -----------------------------------------------------------------------------
