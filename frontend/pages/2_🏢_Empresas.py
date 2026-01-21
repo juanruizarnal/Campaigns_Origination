@@ -1544,7 +1544,7 @@ with tab2:
         selected_companies = [companies[i] for i in selected_indices if i < len(companies)]
         has_selection = len(selected_companies) > 0
         
-        action_cols = st.columns(5)
+        action_cols = st.columns(6)
         
         with action_cols[0]:
             btn_financial = st.button(
@@ -1585,7 +1585,62 @@ with tab2:
                 disabled=not has_selection,
                 key="t2_btn_contacts",
             )
+
+        with action_cols[5]:
+            btn_create_campaign = st.button(
+                "🚀 Crear Campaña",
+                use_container_width=True,
+                disabled=not has_selection,
+                key="t2_btn_create_campaign",
+            )
         
+        # ========== PROCESS CREATE CAMPAIGN ==========
+
+        if btn_create_campaign and has_selection:
+            bu_ids: list[str] = []
+            bu_labels: list[dict] = []
+            errors: list[str] = []
+
+            for company in selected_companies:
+                fields = company.get("fields", {})
+                company_name = fields.get("Company Name", "N/A")
+                company_id = company.get("id")
+
+                if not company_id:
+                    continue
+
+                bu_result = api.get_or_create_business_units(company_id, company_name)
+                if not bu_result.get("success"):
+                    errors.extend(bu_result.get("errors", []))
+                    continue
+
+                for bu in bu_result.get("business_units", []):
+                    bu_id = bu.get("id")
+                    bu_name = bu.get("name") or "Business Unit"
+                    if bu_id:
+                        bu_ids.append(bu_id)
+                        bu_labels.append({
+                            "id": bu_id,
+                            "label": f"{company_name} — {bu_name}",
+                        })
+
+            bu_ids = list(dict.fromkeys(bu_ids))
+            bu_labels = list({item["id"]: item for item in bu_labels}.values())
+
+            if bu_ids:
+                st.session_state["campaign_prefill_bu_ids"] = bu_ids
+                st.session_state["campaign_prefill_business_units"] = bu_labels
+                st.session_state["new_campaign_name"] = ""
+                st.session_state["new_campaign_description"] = ""
+                st.session_state["new_campaign_products"] = []
+                st.session_state["new_campaign_business_units"] = bu_ids
+                st.switch_page("pages/5_📋_Campañas.py")
+            else:
+                error_msg = "No se pudieron preparar Business Units para la campaña."
+                if errors:
+                    error_msg += f" {errors}"
+                st.error(error_msg)
+
         # ========== PROCESS ENRICHMENT ACTIONS ==========
         
         if btn_financial and has_selection:

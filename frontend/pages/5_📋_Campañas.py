@@ -17,6 +17,7 @@ from utils.api import get_api
 from utils.helpers import format_date, get_campaign_status_emoji, truncate_text
 from components.feedback import loading_spinner, success_alert, error_alert, empty_state
 from components.metrics import metric_card
+from core.models import ProductLine
 
 # Page config
 st.set_page_config(
@@ -33,7 +34,7 @@ st.title("📋 Campañas")
 api = get_api()
 
 # Tabs
-tab1, tab2 = st.tabs(["📋 Lista de Campañas", "📊 Detalle de Campaña"])
+tab1, tab2, tab3 = st.tabs(["📋 Lista de Campañas", "📊 Detalle de Campaña", "➕ Nueva Campaña"])
 
 # ============================================================================
 # TAB 1: CAMPAIGN LIST
@@ -131,11 +132,9 @@ with tab1:
         empty_state(
             icon="📋",
             title="No hay campañas",
-            message="Crea tu primera campaña desde el Dashboard o la sección Nueva Campaña",
+            message="Crea tu primera campaña desde la pestaña Nueva Campaña",
             action_label="Crear Campaña",
         )
-        if st.button("🚀 Crear Primera Campaña", type="primary"):
-            st.switch_page("pages/3_🚀_Nueva_Campaña.py")
 
 # ============================================================================
 # TAB 2: CAMPAIGN DETAIL
@@ -285,3 +284,201 @@ with tab2:
                 st.link_button("🔗 Abrir en Airtable", airtable_url, use_container_width=True)
         else:
             error_alert("No se pudo cargar el detalle de la campaña")
+
+# ============================================================================
+# TAB 3: NEW CAMPAIGN
+# ============================================================================
+
+with tab3:
+    st.markdown("### ➕ Nueva Campaña")
+    st.caption("Crea campañas completas con Market_Context y Campaign_Targets.")
+
+    if not api.airtable:
+        error_alert("Airtable no disponible. Revisa la configuración.")
+    else:
+        product_labels = {
+            "Corporate_Debt": "Corporate Debt",
+            "Project_Finance": "Project Finance",
+            "M&A_Advisory": "M&A Advisory",
+            "FEI_Guarantee": "FEI Guarantee",
+            "Refinancing": "Refinancing",
+            "Bridge_Loan": "Bridge Loan",
+        }
+        product_options = [item.value for item in ProductLine]
+
+        prefill_bu_ids = st.session_state.get("campaign_prefill_bu_ids", [])
+        prefill_bus = st.session_state.get("campaign_prefill_business_units", [])
+        prefill_mode = bool(prefill_bu_ids and prefill_bus)
+
+        if prefill_mode:
+            business_units = prefill_bus
+            filtered_bus = prefill_bus
+            st.info("Usando compañías seleccionadas desde Empresas. Completa el contexto para crear la campaña.")
+        else:
+            with loading_spinner("Cargando empresas..."):
+                business_units = api.get_business_units(limit=1000, include_company_fields=True)
+
+            sector_options = sorted({
+                sector
+                for bu in business_units
+                for sector in (bu.get("sector_names") or [])
+                if sector
+            })
+            activity_options = sorted({
+                activity
+                for bu in business_units
+                for activity in (bu.get("activities_names") or [])
+                if activity
+            })
+
+            employee_values = [bu.get("employees") for bu in business_units if bu.get("employees") is not None]
+            revenue_values = [bu.get("revenues") for bu in business_units if bu.get("revenues") is not None]
+
+            st.markdown("#### 🔎 Filtros de compañías")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                selected_sectors = st.multiselect("Sector", options=sector_options)
+            with col2:
+                selected_activities = st.multiselect("Actividad", options=activity_options)
+            with col3:
+                fei_options = ["Todos", "Eligible", "Not_Eligible", "Partially_Eligible", "Pending_Review", "Expired", "Unknown"]
+                selected_fei = st.selectbox("Elegibilidad FEI", options=fei_options)
+
+            col4, col5 = st.columns(2)
+            with col4:
+                emp_min_default = min(employee_values) if employee_values else 0
+                emp_max_default = max(employee_values) if employee_values else 0
+                emp_min = st.number_input("Empleados mín.", min_value=0.0, value=float(emp_min_default))
+                emp_max = st.number_input("Empleados máx.", min_value=0.0, value=float(emp_max_default))
+            with col5:
+                rev_min_default = min(revenue_values) if revenue_values else 0
+                rev_max_default = max(revenue_values) if revenue_values else 0
+                rev_min = st.number_input("Facturación mín. (€)", min_value=0.0, value=float(rev_min_default))
+                rev_max = st.number_input("Facturación máx. (€)", min_value=0.0, value=float(rev_max_default))
+
+            def _matches_filters(bu: dict) -> bool:
+                if selected_sectors:
+                    bu_sectors = set(bu.get("sector_names") or [])
+                    if not bu_sectors.intersection(selected_sectors):
+                        return False
+                if selected_activities:
+                    bu_activities = set(bu.get("activities_names") or [])
+                    if not bu_activities.intersection(selected_activities):
+                        return False
+                if selected_fei != "Todos":
+                    fei_status = bu.get("fei_status") or "Unknown"
+                    if fei_status != selected_fei:
+                        return False
+                if emp_min > 0 or emp_max > 0:
+                    employees = bu.get("employees")
+                    if employees is None:
+                        return False
+                    if emp_min > 0 and employees < emp_min:
+                        return False
+                    if emp_max > 0 and employees > emp_max:
+                        return False
+                if rev_min > 0 or rev_max > 0:
+                    revenues = bu.get("revenues")
+                    if revenues is None:
+                        return False
+                    if rev_min > 0 and revenues < rev_min:
+                        return False
+                    if rev_max > 0 and revenues > rev_max:
+                        return False
+                return True
+
+            filtered_bus = [bu for bu in business_units if _matches_filters(bu)]
+            st.caption(f"Empresas disponibles: {len(filtered_bus)}")
+
+        bu_options = [bu["id"] for bu in filtered_bus]
+        bu_labels = {bu["id"]: bu["label"] for bu in filtered_bus}
+        if "new_campaign_business_units" not in st.session_state:
+            st.session_state["new_campaign_business_units"] = prefill_bu_ids
+        if "new_campaign_name" not in st.session_state:
+            st.session_state["new_campaign_name"] = ""
+        if "new_campaign_description" not in st.session_state:
+            st.session_state["new_campaign_description"] = ""
+        if "new_campaign_products" not in st.session_state:
+            st.session_state["new_campaign_products"] = []
+
+        with st.form("new_campaign_form", clear_on_submit=False):
+            name = st.text_input(
+                "Nombre Campaña *",
+                placeholder="Ej. Renovables Q1 2026",
+                key="new_campaign_name",
+            )
+            description = st.text_area(
+                "Descripción *",
+                height=120,
+                key="new_campaign_description",
+            )
+            products = st.multiselect(
+                "Selección productos de Alter-5 *",
+                options=product_options,
+                format_func=lambda value: product_labels.get(value, value),
+                key="new_campaign_products",
+            )
+            selected_bus = st.multiselect(
+                "Selección de Compañías a contactar *",
+                options=bu_options,
+                format_func=lambda value: bu_labels.get(value, value),
+                key="new_campaign_business_units",
+            )
+
+            selected_labels = [bu_labels.get(bu_id, bu_id) for bu_id in selected_bus]
+            if selected_labels:
+                st.markdown("**Compañías seleccionadas:**")
+                st.markdown(
+                    "<br>".join(f"• {label}" for label in selected_labels),
+                    unsafe_allow_html=True,
+                )
+
+            submitted = st.form_submit_button("🚀 Crear Campaña", type="primary")
+
+        if submitted:
+            errors = []
+            if not name.strip():
+                errors.append("Indica un nombre de campaña.")
+            if not description.strip():
+                errors.append("Añade una descripción.")
+            if not products:
+                errors.append("Selecciona al menos un producto.")
+            if not selected_bus:
+                errors.append("Selecciona al menos una compañía.")
+
+            if errors:
+                for message in errors:
+                    error_alert(message)
+            else:
+                if prefill_mode:
+                    filters_summary = "Origen: Empresas (selección manual)"
+                else:
+                    filters_summary = "; ".join(filter(None, [
+                        f"Sectores: {', '.join(selected_sectors)}" if selected_sectors else None,
+                        f"Actividades: {', '.join(selected_activities)}" if selected_activities else None,
+                        f"Empleados: {int(emp_min)}-{int(emp_max)}" if emp_max or emp_min else None,
+                        f"Facturación: €{int(rev_min)}-€{int(rev_max)}" if rev_max or rev_min else None,
+                        f"FEI: {selected_fei}" if selected_fei != "Todos" else None,
+                        f"Productos: {', '.join(products)}" if products else None,
+                    ]))
+
+                with loading_spinner("Creando campaña y contexto..."):
+                    result = api.create_campaign_with_targets(
+                        campaign_name=name.strip(),
+                        description=description.strip(),
+                        product_lines=products,
+                        business_unit_ids=selected_bus,
+                        filters_summary=filters_summary or None,
+                    )
+
+                if result.get("success"):
+                    success_alert(
+                        f"Campaña creada ✅ Contextos: {result.get('contexts_created', 0)} "
+                        f"| Targets: {result.get('targets_created', 0)}"
+                    )
+                    st.session_state["selected_campaign_id"] = result.get("campaign_id")
+                    st.session_state["campaign_prefill_bu_ids"] = []
+                    st.rerun()
+                else:
+                    error_list = result.get("errors") or ["Error creando campaña"]
+                    error_alert(" | ".join(error_list))

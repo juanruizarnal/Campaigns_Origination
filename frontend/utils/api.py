@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import sys
 import re
+from datetime import date, timedelta
+from urllib.parse import urlparse
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional, List, Callable, Any
@@ -1008,6 +1010,400 @@ class OriginationAPI:
                     tone=tone,
                 )
             return {"success": False, "errors": ["Orchestrator no disponible"]}
+        except Exception as e:
+            return {"success": False, "errors": [str(e)]}
+
+    def _parse_numeric(self, value: Any) -> Optional[float]:
+        """Parse numeric values from Airtable fields or strings."""
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            cleaned = value.replace(".", "").replace(",", ".")
+            cleaned = re.sub(r"[^\d\.]", "", cleaned)
+            try:
+                return float(cleaned)
+            except ValueError:
+                return None
+        return None
+
+    def _truncate_words(self, text: str, max_words: int = 150) -> str:
+        words = (text or "").split()
+        if len(words) <= max_words:
+            return text or ""
+        return " ".join(words[:max_words]).rstrip() + "..."
+
+    def _format_products(self, product_lines: list[str]) -> str:
+        pretty_map = {
+            "Corporate_Debt": "Corporate Debt",
+            "Project_Finance": "Project Finance",
+            "M&A_Advisory": "M&A Advisory",
+            "FEI_Guarantee": "FEI Guarantee",
+            "Refinancing": "Refinancing",
+            "Bridge_Loan": "Bridge Loan",
+        }
+        formatted = [pretty_map.get(p, p.replace("_", " ").replace("-", " ")) for p in product_lines]
+        return ", ".join(formatted)
+
+    def get_business_units(self, limit: int = 500, include_company_fields: bool = False) -> list[dict]:
+        """List business units with derived company labels and optional company fields."""
+        try:
+            if not self.airtable:
+                return []
+
+            records = self.airtable.query_records("business_units", max_records=limit)
+            result: list[dict] = []
+            company_cache: dict[str, dict] = {}
+
+            for record in records:
+                fields = record.get("fields", {})
+                bu_name = fields.get("Business Unit Name") or fields.get("Name") or "Sin nombre"
+
+                company_name = None
+                for key in (
+                    "Company Name",
+                    "Company Name (from Company)",
+                    "Company Name (from Companies)",
+                    "Company (from Company)",
+                ):
+                    value = fields.get(key)
+                    if value:
+                        company_name = value[0] if isinstance(value, list) else value
+                        break
+
+                if not company_name:
+                    company_name = "Empresa"
+
+                sector_names = fields.get("Sector_Names") or fields.get("Sector Names") or fields.get("Sector") or []
+                if isinstance(sector_names, str):
+                    sector_names = [sector_names]
+
+                activities_names = fields.get("Activities_Names") or fields.get("Activities Names") or fields.get("Activities") or []
+                if isinstance(activities_names, str):
+                    activities_names = [activities_names]
+
+                employees = None
+                revenues = None
+                fei_status = None
+                company_description = None
+                company_url = None
+
+                if include_company_fields and fields.get("Company"):
+                    company_id = fields.get("Company")[0] if isinstance(fields.get("Company"), list) else fields.get("Company")
+                    if company_id:
+                        if company_id not in company_cache:
+                            company_cache[company_id] = self.airtable.get_record("companies", company_id)
+                        company_fields = company_cache[company_id].get("fields", {})
+                        employees = self._parse_numeric(company_fields.get("Num Employees"))
+                        revenues = self._parse_numeric(company_fields.get("Revenues"))
+                        fei_status = company_fields.get("FEI_Status")
+                        company_description = company_fields.get("Description")
+                        company_url = company_fields.get("Home URL") or company_fields.get("Home_URL")
+
+                result.append({
+                    "id": record.get("id"),
+                    "business_unit_name": bu_name,
+                    "company_name": company_name,
+                    "label": f"{company_name} — {bu_name}",
+                    "company_ids": fields.get("Company", []),
+                    "sector_ids": fields.get("Sector", []) if isinstance(fields.get("Sector"), list) else [],
+                    "country_ids": fields.get("Focus Countries", []) if isinstance(fields.get("Focus Countries"), list) else [],
+                    "sector_names": sector_names,
+                    "activities_names": activities_names,
+                    "employees": employees,
+                    "revenues": revenues,
+                    "fei_status": fei_status,
+                    "company_description": company_description,
+                    "company_url": company_url,
+                })
+
+            return result
+        except Exception as e:
+            st.error(f"Error cargando business units: {e}")
+            return []
+
+    def _build_company_context(
+        self,
+        company_name: str,
+        company_url: str | None,
+        company_description: str | None,
+        product_lines: list[str],
+        filters_summary: str | None = None,
+    ) -> dict:
+        """Generate a market context payload for a company."""
+        summary = (company_description or "").strip()
+        if not summary:
+            summary = f"Contexto inicial generado para {company_name}."
+
+        source_url = company_url or ""
+        source_name = urlparse(source_url).netloc if source_url else "Web"
+        key_implications = [
+            "Posible encaje con Alter-5 según actividad y tamaño.",
+            "Oportunidad de originación con enfoque personalizado.",
+        ]
+
+        try:
+            from integrations.gemini import get_gemini_client
+
+            prompt = (
+                "Resume en español el contexto reciente y actividad de la empresa "
+                f"{company_name}. Incluye hechos relevantes y oportunidades potenciales."
+            )
+            if filters_summary:
+                prompt += f"\nFiltros de campaña: {filters_summary}"
+            result = get_gemini_client().search_and_generate(
+                query=prompt,
+                system_prompt="Devuelve un resumen breve y factual (máx 6 frases).",
+            )
+            response_text = (result or {}).get("response") or ""
+            sources = (result or {}).get("sources") or []
+
+            if response_text.strip():
+                summary = response_text.strip()
+            if sources:
+                source_url = sources[0]
+                source_name = urlparse(source_url).netloc or source_name
+        except Exception:
+            pass
+
+        return {
+            "summary": summary,
+            "source_url": source_url,
+            "source_name": source_name,
+            "key_implications": "\n".join(f"- {item}" for item in key_implications),
+        }
+
+    def _generate_personalized_email(
+        self,
+        company_name: str,
+        campaign_name: str,
+        campaign_description: str,
+        product_lines: list[str],
+        context_summary: str,
+        key_implications: str,
+    ) -> tuple[str, str]:
+        """Generate a high-quality personalized email."""
+        products_text = self._format_products(product_lines)
+        subject = f"{company_name} | {campaign_name}"
+        body = (
+            f"Hola {company_name},\n\n"
+            f"Estamos siguiendo de cerca {context_summary.lower()} y creemos que puede "
+            f"generar oportunidades relevantes para vuestra compañía. En Alter-5 podemos "
+            f"aportar soluciones en {products_text or 'financiación y originación'}, alineadas con "
+            f"{campaign_description.lower()}.\n\n"
+            "¿Te parece si coordinamos una llamada breve para compartir ideas y posibles estructuras?\n\n"
+            "Un saludo,\nAlter-5"
+        )
+
+        try:
+            from integrations.gemini import get_gemini_client
+
+            prompt = (
+                "Redacta un email outbound en español con alta personalización.\n"
+                f"Compañía: {company_name}\n"
+                f"Campaña: {campaign_name}\n"
+                f"Descripción campaña: {campaign_description}\n"
+                f"Productos Alter-5: {products_text}\n"
+                f"Contexto de mercado: {context_summary}\n"
+                f"Implicaciones clave: {key_implications}\n"
+                "Requisitos: 100-130 palabras, profesional, menciona el contexto de mercado y "
+                "la propuesta de Alter-5, incluye CTA a llamada. Devuelve JSON con campos "
+                "subject y body."
+            )
+            result = get_gemini_client().generate_json(prompt)
+            subject = result.get("subject", subject) if isinstance(result, dict) else subject
+            body = result.get("body", body) if isinstance(result, dict) else body
+        except Exception:
+            pass
+
+        body = self._truncate_words(body, 150)
+        return subject, body
+
+    def create_campaign_with_targets(
+        self,
+        campaign_name: str,
+        description: str,
+        product_lines: list[str],
+        business_unit_ids: list[str],
+        filters_summary: str | None = None,
+    ) -> dict:
+        """Create campaign + market contexts + campaign targets."""
+        try:
+            if not self.airtable:
+                return {"success": False, "errors": ["Airtable no disponible"]}
+
+            if not campaign_name or not description:
+                return {"success": False, "errors": ["Nombre y descripción son obligatorios"]}
+
+            if not business_unit_ids:
+                return {"success": False, "errors": ["Selecciona al menos una compañía"]}
+
+            today = date.today()
+            end_date = today + timedelta(days=30)
+
+            context_ids: list[str] = []
+            target_ids: list[str] = []
+            target_sector_ids: set[str] = set()
+            target_country_ids: set[str] = set()
+            context_by_bu: dict[str, dict] = {}
+            company_by_bu: dict[str, str] = {}
+
+            bu_records = []
+            for bu_id in business_unit_ids:
+                bu_records.append(self.airtable.get_record("business_units", bu_id))
+
+            for bu_record in bu_records:
+                bu_fields = bu_record.get("fields", {})
+                bu_name = bu_fields.get("Business Unit Name") or "Business Unit"
+                company_ids = bu_fields.get("Company") or []
+
+                company_name = None
+                company_url = None
+                company_description = None
+
+                if company_ids:
+                    company_record = self.airtable.get_record("companies", company_ids[0])
+                    company_fields = company_record.get("fields", {})
+                    company_name = company_fields.get("Company Name") or company_fields.get("Name")
+                    company_url = company_fields.get("Home URL") or company_fields.get("Home_URL")
+                    company_description = company_fields.get("Description")
+
+                if not company_name:
+                    company_name = bu_fields.get("Company Name") or "Empresa"
+
+                sector_ids = bu_fields.get("Sector") if isinstance(bu_fields.get("Sector"), list) else []
+                country_ids = bu_fields.get("Focus Countries") if isinstance(bu_fields.get("Focus Countries"), list) else []
+
+                target_sector_ids.update(sector_ids)
+                target_country_ids.update(country_ids)
+
+                context_payload = self._build_company_context(
+                    company_name=company_name,
+                    company_url=company_url,
+                    company_description=company_description,
+                    product_lines=product_lines,
+                    filters_summary=filters_summary,
+                )
+
+                context_fields = {
+                    "Context_Title": f"{company_name} - Contexto de mercado",
+                    "Context_Type": "Other",
+                    "Source_URL": context_payload["source_url"],
+                    "Source_Name": context_payload["source_name"],
+                    "Publication_Date": today.isoformat(),
+                    "Summary": context_payload["summary"],
+                    "Key_Implications": context_payload["key_implications"],
+                    "Notes": f"Contexto generado para campaña {campaign_name}.",
+                    "Campaign_Potential": 3,
+                    "Status": "Analyzed",
+                    "Affected_Sectors": sector_ids,
+                    "Affected_Countries": country_ids,
+                }
+
+                context_record = self.airtable.create_record("market_context", context_fields)
+                context_ids.append(context_record.get("id"))
+                context_by_bu[bu_record.get("id")] = context_payload
+                company_by_bu[bu_record.get("id")] = company_name
+
+            campaign_fields = {
+                "Campaign_Name": campaign_name,
+                "Description": description,
+                "Campaign_Size": "Personal" if len(business_unit_ids) <= 5 else "Micro-Targeting",
+                "Status": "Draft",
+                "Product_Line": product_lines,
+                "Priority": "Medium",
+                "Scheduled_Start_Date": today.isoformat(),
+                "Scheduled_End_Date": end_date.isoformat(),
+                "Campaign_Rationale": description,
+                "Email_Subject_Template_ES": f"{campaign_name} | Alter-5",
+                "Email_Subject_Template_EN": f"{campaign_name} | Alter-5",
+                "Email_Body_Template_ES": (
+                    "Hola,\n\n"
+                    "Queremos compartir una propuesta relevante basada en el contexto reciente "
+                    "de su compañía. Coordinemos una conversación para valorar posibles sinergias.\n\n"
+                    "Un saludo,\nAlter-5"
+                ),
+                "Email_Body_Template_EN": (
+                    "Hello,\n\n"
+                    "We would like to share a relevant proposal based on your company's recent context. "
+                    "Let's schedule a conversation to explore potential synergies.\n\n"
+                    "Best regards,\nAlter-5"
+                ),
+                "Target_Ticket_Min": 0,
+                "Target_Ticket_Max": 0,
+                "Market_Context": context_ids,
+                "Target_Stakeholder_Types": [],
+                "Target_Sectors": list(target_sector_ids),
+                "Target_Countries": list(target_country_ids),
+                "Owner": [],
+                "Campaign_Targets": [],
+                "AI_Generated": True,
+                "Notes": (
+                    "Campaña creada manualmente desde Streamlit."
+                    + (f"\nFiltros: {filters_summary}" if filters_summary else "")
+                ),
+            }
+
+            campaign_record = self.airtable.get_table("campaigns").create(campaign_fields, typecast=True)
+            campaign_id = campaign_record.get("id")
+
+            for context_id in context_ids:
+                self.airtable.update_record(
+                    "market_context",
+                    context_id,
+                    {"Origination_Campaigns": [campaign_id], "Status": "Campaign_Created"},
+                    typecast=True,
+                )
+
+            for bu_record in bu_records:
+                bu_fields = bu_record.get("fields", {})
+                bu_id = bu_record.get("id")
+                bu_name = bu_fields.get("Business Unit Name") or "Business Unit"
+                company_name = company_by_bu.get(bu_id) or bu_fields.get("Company Name") or "Empresa"
+
+                context_payload = context_by_bu.get(bu_id, {})
+                context_summary = context_payload.get("summary") or "el contexto reciente del sector"
+                key_implications = context_payload.get("key_implications") or ""
+                subject, body = self._generate_personalized_email(
+                    company_name=company_name,
+                    campaign_name=campaign_name,
+                    campaign_description=description,
+                    product_lines=product_lines,
+                    context_summary=context_summary,
+                    key_implications=key_implications,
+                )
+
+                target_fields = {
+                    "Target_Name": f"{company_name} - {bu_name}",
+                    "Selection_Justification": (
+                        f"Encaje por contexto de mercado y productos ({self._format_products(product_lines)})."
+                    ),
+                    "Personalization_Context": (
+                        f"Contexto mercado: {context_summary}\n\n"
+                        f"Campaña: {campaign_name} | {description}"
+                    ),
+                    "Personalized_Email_Subject": subject,
+                    "Personalized_Email_Body": body,
+                    "Fit_Score": 0.65,
+                    "AI_Confidence": 0.7,
+                    "Status": "Pending_Review",
+                    "Campaign": [campaign_id],
+                    "Business_Unit": [bu_id],
+                }
+
+                target_record = self.airtable.create_record("campaign_targets", target_fields)
+                target_ids.append(target_record.get("id"))
+
+            if target_ids:
+                self.airtable.update_record("campaigns", campaign_id, {"Campaign_Targets": target_ids})
+
+            return {
+                "success": True,
+                "campaign_id": campaign_id,
+                "contexts_created": len(context_ids),
+                "targets_created": len(target_ids),
+            }
         except Exception as e:
             return {"success": False, "errors": [str(e)]}
     
