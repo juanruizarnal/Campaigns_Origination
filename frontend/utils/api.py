@@ -1185,14 +1185,15 @@ class OriginationAPI:
     ) -> tuple[str, str]:
         """Generate a high-quality personalized email."""
         products_text = self._format_products(product_lines)
-        subject = f"{company_name} | {campaign_name}"
+        subject = f"{campaign_name} | Alter-5 para {company_name}"
+        safe_context = context_summary or "la evolución reciente de vuestra compañía"
+        safe_products = products_text or "financiación y originación"
         body = (
             f"Hola {company_name},\n\n"
-            f"Estamos siguiendo de cerca {context_summary.lower()} y creemos que puede "
-            f"generar oportunidades relevantes para vuestra compañía. En Alter-5 podemos "
-            f"aportar soluciones en {products_text or 'financiación y originación'}, alineadas con "
-            f"{campaign_description.lower()}.\n\n"
-            "¿Te parece si coordinamos una llamada breve para compartir ideas y posibles estructuras?\n\n"
+            f"En Alter-5 hemos analizado {safe_context} y vemos un encaje claro con la campaña "
+            f"“{campaign_name}”. En concreto, {campaign_description} y nuestro enfoque en "
+            f"{safe_products} podrían ayudaros a avanzar con más eficiencia.\n\n"
+            "¿Te parece si coordinamos una llamada breve para compartir una propuesta concreta?\n\n"
             "Un saludo,\nAlter-5"
         )
 
@@ -1207,15 +1208,35 @@ class OriginationAPI:
                 f"Productos Alter-5: {products_text}\n"
                 f"Contexto de mercado: {context_summary}\n"
                 f"Implicaciones clave: {key_implications}\n"
-                "Requisitos: 100-130 palabras, profesional, menciona el contexto de mercado y "
-                "la propuesta de Alter-5, incluye CTA a llamada. Devuelve JSON con campos "
-                "subject y body."
+                "Requisitos: 100-130 palabras, profesional, escrito desde Alter-5 hacia la compañía. "
+                "Menciona el contexto de mercado y la propuesta de Alter-5. Incluye CTA a llamada. "
+                "No uses placeholders ni corchetes. Devuelve JSON con campos subject y body."
             )
             result = get_gemini_client().generate_json(prompt)
             subject = result.get("subject", subject) if isinstance(result, dict) else subject
             body = result.get("body", body) if isinstance(result, dict) else body
         except Exception:
             pass
+
+        if any(token in (body or "") for token in ["[Nombre", "[Nombre de", "[Mencionar", "[Enlace"]):
+            body = (
+                f"Hola {company_name},\n\n"
+                f"Desde Alter-5 hemos analizado {safe_context} y creemos que la campaña "
+                f"“{campaign_name}” encaja bien con vuestra situación. Nuestra propuesta combina "
+                f"{safe_products} para apoyar vuestros próximos pasos con una estructura eficiente.\n\n"
+                "¿Te parece si coordinamos una llamada breve para revisar opciones?\n\n"
+                "Un saludo,\nAlter-5"
+            )
+
+        if "Alter-5" not in (body or ""):
+            body = (
+                f"Hola {company_name},\n\n"
+                f"En Alter-5 hemos analizado {safe_context} y creemos que la campaña "
+                f"“{campaign_name}” puede aportar valor. {campaign_description}\n\n"
+                f"Nuestro enfoque en {safe_products} puede ayudaros a avanzar con más eficiencia. "
+                "¿Te parece si coordinamos una llamada breve para revisar opciones?\n\n"
+                "Un saludo,\nAlter-5"
+            )
 
         body = self._truncate_words(body, 150)
         return subject, body
@@ -1306,6 +1327,8 @@ class OriginationAPI:
                 context_by_bu[bu_record.get("id")] = context_payload
                 company_by_bu[bu_record.get("id")] = company_name
 
+            campaign_products = self._format_products(product_lines) or "soluciones de financiación de Alter-5"
+
             campaign_fields = {
                 "Campaign_Name": campaign_name,
                 "Description": description,
@@ -1320,14 +1343,17 @@ class OriginationAPI:
                 "Email_Subject_Template_EN": f"{campaign_name} | Alter-5",
                 "Email_Body_Template_ES": (
                     "Hola,\n\n"
-                    "Queremos compartir una propuesta relevante basada en el contexto reciente "
-                    "de su compañía. Coordinemos una conversación para valorar posibles sinergias.\n\n"
+                    f"En Alter-5 lanzamos la campaña “{campaign_name}”. {description} "
+                    f"Nos enfocamos en {campaign_products} para apoyar oportunidades "
+                    "de financiación y crecimiento. Nos gustaría coordinar una breve conversación "
+                    "para compartir más detalles.\n\n"
                     "Un saludo,\nAlter-5"
                 ),
                 "Email_Body_Template_EN": (
                     "Hello,\n\n"
-                    "We would like to share a relevant proposal based on your company's recent context. "
-                    "Let's schedule a conversation to explore potential synergies.\n\n"
+                    f"At Alter-5 we are running the “{campaign_name}” campaign. {description} "
+                    f"Our focus includes {campaign_products} to support financing "
+                    "and growth opportunities. We would love to set up a short call to share details.\n\n"
                     "Best regards,\nAlter-5"
                 ),
                 "Target_Ticket_Min": 0,
