@@ -1,0 +1,10 @@
+# Frontend dependencies for Alter-5 Origination Engine
+# Install with: pip install -r frontend/requirements.txt
+
+-r ../requirements.txt
+
+streamlit==1.31.0
+streamlit-option-menu==0.3.6
+plotly==5.18.0
+pandas>=2.0.0
+

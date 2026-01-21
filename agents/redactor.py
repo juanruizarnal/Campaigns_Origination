@@ -84,10 +84,16 @@ class TargetContext:
     country: Optional[str] = None
     fei_status: str = "Unknown"
     fei_criteria_met: list[str] = field(default_factory=list)
+    fei_certificates: list[str] = field(default_factory=list)
     contact_name: Optional[str] = None
     contact_first_name: Optional[str] = None
     contact_role: Optional[str] = None
     contact_email: Optional[str] = None
+    contact_linkedin_url: Optional[str] = None
+    contact_recent_posts: list[str] = field(default_factory=list)
+    company_linkedin_url: Optional[str] = None
+    company_recent_posts: list[str] = field(default_factory=list)
+    company_description: Optional[str] = None
     selection_justification: Optional[str] = None
     fit_score: float = 0.0
     campaign_trigger: Optional[str] = None
@@ -101,6 +107,21 @@ class TargetContext:
             and self.company_name is not None
             and (self.sector is not None or self.fei_status != "Unknown")
         )
+    
+    def has_linkedin_context(self) -> bool:
+        """Check if LinkedIn data is available for ultra-personalization."""
+        return bool(self.contact_recent_posts) or bool(self.company_recent_posts)
+    
+    def get_personalization_level(self) -> str:
+        """Get the level of personalization possible."""
+        if self.has_linkedin_context():
+            return "ultra"  # Can reference recent posts
+        elif self.has_personalization_data():
+            return "high"  # Has contact name, company, sector
+        elif self.company_name:
+            return "medium"  # Has company at least
+        else:
+            return "basic"  # Generic
 
 
 @dataclass
@@ -491,6 +512,8 @@ class RedactorMensajes:
         contact_first_name = None
         contact_role = None
         contact_email = None
+        contact_linkedin_url = None
+        contact_recent_posts = []
         
         if contact_ids:
             try:
@@ -502,7 +525,42 @@ class RedactorMensajes:
                 contact_first_name = first_name
                 contact_role = contact_fields.get("Role")
                 contact_email = contact_fields.get("Email")
+                contact_linkedin_url = contact_fields.get("LinkedIn_URL") or contact_fields.get("linkedin_url")
+                
+                # Try to get recent LinkedIn posts
+                linkedin_data_str = contact_fields.get("LinkedIn_Data")
+                if linkedin_data_str:
+                    try:
+                        import json
+                        linkedin_data = json.loads(linkedin_data_str) if isinstance(linkedin_data_str, str) else linkedin_data_str
+                        contact_recent_posts = linkedin_data.get("recent_posts", [])[:3]
+                    except (json.JSONDecodeError, TypeError):
+                        pass
             except AirtableError:
+                pass
+        
+        # Get company LinkedIn data
+        company_linkedin_url = None
+        company_recent_posts = []
+        company_description = None
+        fei_certificates = []
+        
+        if company_id:
+            try:
+                # Reuse company_fields if already fetched
+                company_linkedin_url = company_fields.get("LinkedIn_URL") if company_fields else None
+                company_description = company_fields.get("Description") if company_fields else None
+                fei_certificates = company_fields.get("Certificates", []) if company_fields else []
+                
+                linkedin_data_str = company_fields.get("LinkedIn_Data") if company_fields else None
+                if linkedin_data_str:
+                    try:
+                        import json
+                        linkedin_data = json.loads(linkedin_data_str) if isinstance(linkedin_data_str, str) else linkedin_data_str
+                        company_recent_posts = linkedin_data.get("recent_posts", [])[:3]
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+            except:
                 pass
         
         return TargetContext(
@@ -516,10 +574,16 @@ class RedactorMensajes:
             country=country,
             fei_status=fei_status,
             fei_criteria_met=fei_criteria_met,
+            fei_certificates=fei_certificates,
             contact_name=contact_name,
             contact_first_name=contact_first_name,
             contact_role=contact_role,
             contact_email=contact_email,
+            contact_linkedin_url=contact_linkedin_url,
+            contact_recent_posts=contact_recent_posts,
+            company_linkedin_url=company_linkedin_url,
+            company_recent_posts=company_recent_posts,
+            company_description=company_description,
             selection_justification=target_fields.get("Selection_Justification"),
             fit_score=target_fields.get("Fit_Score", 0.0),
             campaign_trigger=campaign_trigger,
@@ -602,6 +666,27 @@ Return ONLY a JSON object:
         Returns:
             Generated email body (target max 150 words)
         """
+        # Build LinkedIn context if available (ultra-personalization)
+        linkedin_context = ""
+        if context.has_linkedin_context():
+            if context.contact_recent_posts:
+                linkedin_context += f"""
+LINKEDIN CONTEXT (use to personalize):
+- Recent posts by {context.contact_first_name}: {'; '.join(context.contact_recent_posts[:2])}
+"""
+            if context.company_recent_posts:
+                linkedin_context += f"""
+- Recent company posts: {'; '.join(context.company_recent_posts[:2])}
+"""
+            linkedin_context += """
+IMPORTANT: Reference a specific post or activity naturally in your message to show research.
+"""
+        
+        # Build certificates context
+        certs_context = ""
+        if context.fei_certificates:
+            certs_context = f"\n- Green Certificates: {', '.join(context.fei_certificates)}"
+        
         prompt = f"""
 Generate a personalized B2B sales email body for an origination campaign.
 
@@ -613,8 +698,9 @@ TARGET INFORMATION:
 - Sector: {context.sector or 'N/A'}
 - Country: {context.country or 'N/A'}
 - FEI Status: {context.fei_status}
-- FEI Criteria Met: {', '.join(context.fei_criteria_met) if context.fei_criteria_met else 'None'}
-
+- FEI Criteria Met: {', '.join(context.fei_criteria_met) if context.fei_criteria_met else 'None'}{certs_context}
+- Company Description: {context.company_description[:200] if context.company_description else 'N/A'}
+{linkedin_context}
 CAMPAIGN CONTEXT:
 Trigger: {context.campaign_trigger or 'General outreach'}
 Key Angles: {', '.join(context.key_angles) if context.key_angles else 'None specified'}
@@ -622,13 +708,13 @@ Recommended Product: {context.product_recommendation or 'FEI Guarantee'}
 Selection Reason: {context.selection_justification or 'Good fit for campaign'}
 
 REQUIREMENTS:
-- Max 150 words STRICTLY
+- Max {MAX_EMAIL_WORDS} words STRICTLY
 - Tone: {tone}
 - Language: Spanish
 - Structure:
   1. Personalized opening mentioning contact by first name
-  2. Connection to campaign trigger/market context
-  3. Value proposition specific to their situation
+  2. {"Reference to recent LinkedIn activity if available, or " if context.has_linkedin_context() else ""}Connection to campaign trigger/market context
+  3. Value proposition specific to their situation (highlight FEI eligibility if applicable)
   4. Clear CTA (call/meeting request)
   5. Professional closing
 
@@ -697,12 +783,14 @@ Alter5"""
         """Calculate how personalized the message is.
         
         Score based on:
-        - Contact name used: +0.2
-        - Company name used: +0.2
+        - Contact name used: +0.15
+        - Company name used: +0.15
         - Sector mentioned: +0.15
         - FEI/criteria mentioned: +0.15
         - Campaign trigger integrated: +0.15
-        - Role mentioned: +0.15
+        - Role mentioned: +0.10
+        - LinkedIn reference: +0.15 (ultra-personalization)
+        - Certificates mentioned: +0.09
         
         Args:
             context: Target context
@@ -716,18 +804,18 @@ Alter5"""
         
         # Contact name used
         if context.contact_first_name and context.contact_first_name.lower() in body_lower:
-            score += 0.2
+            score += 0.15
         
         # Company name used
         if context.company_name and context.company_name.lower() in body_lower:
-            score += 0.2
+            score += 0.15
         
         # Sector mentioned
         if context.sector and context.sector.lower() in body_lower:
             score += 0.15
         
         # FEI mentioned
-        if "fei" in body_lower or "fondo europeo" in body_lower:
+        if "fei" in body_lower or "fondo europeo" in body_lower or "garantía europea" in body_lower:
             score += 0.15
         
         # Campaign trigger integrated
@@ -739,7 +827,29 @@ Alter5"""
         
         # Role mentioned
         if context.contact_role and context.contact_role.lower() in body_lower:
+            score += 0.10
+        
+        # LinkedIn reference (ultra-personalization bonus)
+        linkedin_referenced = False
+        if context.contact_recent_posts:
+            for post in context.contact_recent_posts:
+                if any(word.lower() in body_lower for word in post.split()[:5] if len(word) > 4):
+                    linkedin_referenced = True
+                    break
+        if context.company_recent_posts and not linkedin_referenced:
+            for post in context.company_recent_posts:
+                if any(word.lower() in body_lower for word in post.split()[:5] if len(word) > 4):
+                    linkedin_referenced = True
+                    break
+        if linkedin_referenced or "linkedin" in body_lower or "publicación" in body_lower:
             score += 0.15
+        
+        # Certificates mentioned
+        if context.fei_certificates:
+            for cert in context.fei_certificates:
+                if cert.lower() in body_lower:
+                    score += 0.09
+                    break
         
         return min(1.0, score)
     

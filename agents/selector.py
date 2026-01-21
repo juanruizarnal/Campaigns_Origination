@@ -40,27 +40,26 @@ settings = get_settings()
 
 
 # ==============================================================================
-# CONSTANTS
+# CONSTANTS (from settings)
 # ==============================================================================
 
-# Cooling-off period in days
-COOLING_OFF_DAYS = 90
+# Get values from settings
+COOLING_OFF_DAYS = settings.COOLING_OFF_DAYS
+MAX_TARGETS_PER_CAMPAIGN = settings.MAX_TARGETS_PER_CAMPAIGN
+MIN_FIT_SCORE = settings.MIN_FIT_SCORE
 
-# Maximum targets per campaign
-MAX_TARGETS_PER_CAMPAIGN = 30
-
-# Minimum fit score to include in selection
-MIN_FIT_SCORE = 0.6
-
-# Fit score weights
+# Fit score weights - Enhanced FEI prioritization per PRD requirements
 SCORE_WEIGHTS = {
-    "fei_eligible": 0.20,        # +20% if FEI eligible
+    "fei_eligible": 0.20,          # +20% if FEI eligible
+    "fei_has_certificates": 0.10,  # +10% if has green certificates
     "key_person_identified": 0.15,  # +15% if key person exists
-    "sector_match": 0.15,         # +15% if sector matches
-    "country_match": 0.10,        # +10% if country matches
-    "financials_complete": 0.10,  # +10% if financials available
-    "positive_engagement": 0.10,  # +10% if positive previous engagement
-    "base": 0.50,                 # Base score 50%
+    "sector_match": 0.15,          # +15% if sector matches
+    "country_match": 0.08,         # +8% if country matches
+    "financials_complete": 0.08,   # +8% if financials available
+    "positive_engagement": 0.10,   # +10% if positive previous engagement
+    "linkedin_data": 0.07,         # +7% if LinkedIn data available
+    "recent_activity": 0.05,       # +5% if recent company activity
+    "base": 0.50,                  # Base score 50%
 }
 
 
@@ -79,13 +78,19 @@ class TargetCandidate:
     country: Optional[str] = None
     fei_status: str = "Unknown"
     fei_criteria_met: list[str] = field(default_factory=list)
+    fei_certificates: list[str] = field(default_factory=list)
     has_key_person: bool = False
     key_person_name: Optional[str] = None
     key_person_role: Optional[str] = None
+    key_person_linkedin: Optional[str] = None
     contact_id: Optional[str] = None
     has_financials: bool = False
+    has_linkedin_data: bool = False
+    linkedin_company_url: Optional[str] = None
+    recent_linkedin_posts: list[str] = field(default_factory=list)
     last_outreach_date: Optional[date] = None
     previous_engagement: Optional[str] = None
+    company_description: Optional[str] = None
     fit_score: float = 0.0
     score_breakdown: dict = field(default_factory=dict)
     selection_justification: str = ""
@@ -102,6 +107,15 @@ class TargetCandidate:
         if self.last_outreach_date is None:
             return None
         return (date.today() - self.last_outreach_date).days
+    
+    def has_green_certificates(self) -> bool:
+        """Check if company has relevant green certificates for FEI."""
+        green_certs = ["ISO 14001", "ISO 50001", "EMAS", "B Corp", "EcoLabel"]
+        return any(
+            cert.lower() in c.lower() 
+            for c in self.fei_certificates 
+            for cert in green_certs
+        )
 
 
 @dataclass
@@ -182,6 +196,7 @@ class SelectorTargets:
         max_targets: int = MAX_TARGETS_PER_CAMPAIGN,
         min_fit_score: float = MIN_FIT_SCORE,
         include_cooling_off: bool = False,
+        prioritize_fei: bool = True,
         dry_run: bool = False,
     ) -> SelectionResult:
         """Select targets for a campaign.
@@ -262,6 +277,7 @@ class SelectorTargets:
                     candidate=candidate,
                     affected_sectors=affected_sectors,
                     affected_countries=affected_countries,
+                    prioritize_fei=prioritize_fei,
                 )
             
             # 4. Filter by minimum score
@@ -421,6 +437,7 @@ class SelectorTargets:
                             key_person = {
                                 "name": f"{contact_fields.get('First Name', '')} {contact_fields.get('Last Name', '')}".strip(),
                                 "role": contact_fields.get("Role", ""),
+                                "linkedin": contact_fields.get("LinkedIn_URL") or contact_fields.get("linkedin_url"),
                             }
                             contact_id = contact_ids[0]
                     except AirtableError:
@@ -439,6 +456,36 @@ class SelectorTargets:
                 financials_ids = company_fields.get("Financials", [])
                 has_financials = len(financials_ids) > 0
                 
+                # Check for LinkedIn data
+                linkedin_url = company_fields.get("LinkedIn_URL") or company_fields.get("linkedin_url")
+                has_linkedin = bool(linkedin_url) or bool(company_fields.get("LinkedIn_Data"))
+                
+                # Get certificates
+                certificates = company_fields.get("Certificates", [])
+                if not certificates:
+                    # Try to get from Company_Certificates linked table
+                    cert_ids = company_fields.get("Company_Certificates", [])
+                    if cert_ids:
+                        try:
+                            for cert_id in cert_ids[:5]:  # Limit to 5 certs
+                                cert_record = self._airtable.get_record("company_certificates", cert_id)
+                                cert_name = cert_record.get("fields", {}).get("Certificate_Name")
+                                if cert_name:
+                                    certificates.append(cert_name)
+                        except AirtableError:
+                            pass
+                
+                # Get recent LinkedIn posts if available
+                recent_posts = []
+                linkedin_data_str = company_fields.get("LinkedIn_Data")
+                if linkedin_data_str:
+                    try:
+                        import json
+                        linkedin_data = json.loads(linkedin_data_str) if isinstance(linkedin_data_str, str) else linkedin_data_str
+                        recent_posts = linkedin_data.get("recent_posts", [])[:3]
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                
                 candidate = TargetCandidate(
                     business_unit_id=bu_id,
                     business_unit_name=bu_fields.get("Business Unit Name", "Unknown"),
@@ -448,13 +495,19 @@ class SelectorTargets:
                     country=bu_fields.get("Country") or company_fields.get("Country"),
                     fei_status=company_fields.get("FEI_Status", "Unknown"),
                     fei_criteria_met=company_fields.get("FEI_Criteria_Met", []),
+                    fei_certificates=certificates,
                     has_key_person=key_person is not None,
                     key_person_name=key_person["name"] if key_person else None,
                     key_person_role=key_person["role"] if key_person else None,
+                    key_person_linkedin=key_person.get("linkedin") if key_person else None,
                     contact_id=contact_id,
                     has_financials=has_financials,
+                    has_linkedin_data=has_linkedin,
+                    linkedin_company_url=linkedin_url,
+                    recent_linkedin_posts=recent_posts,
                     last_outreach_date=last_outreach,
                     previous_engagement=bu_fields.get("Previous_Engagement"),
+                    company_description=company_fields.get("Description"),
                 )
                 
                 candidates.append(candidate)
@@ -484,57 +537,86 @@ class SelectorTargets:
         candidate: TargetCandidate,
         affected_sectors: list[str],
         affected_countries: list[str],
+        prioritize_fei: bool = True,
     ) -> None:
         """Calculate fit score for a candidate.
         
-        Score components:
+        Score components (enhanced for FEI prioritization per PRD):
         - Base: 50%
-        - FEI Eligible: +20%
+        - FEI Eligible: +20% (strategic priority)
+        - FEI Certificates: +10% (green certs boost)
         - Key Person: +15%
         - Sector Match: +15%
-        - Country Match: +10%
-        - Financials: +10%
+        - Country Match: +8%
+        - Financials: +8%
         - Positive Engagement: +10%
+        - LinkedIn Data: +7%
+        - Recent Activity: +5%
         
-        Max score: 130% (clamped to 100%)
+        Max theoretical score: 145% (clamped to 100%)
         
         Args:
             candidate: The candidate to score
             affected_sectors: Target sectors
             affected_countries: Target countries
+            prioritize_fei: If True, apply stronger FEI boost
         """
         score = SCORE_WEIGHTS["base"]
         breakdown = {"base": SCORE_WEIGHTS["base"]}
         
-        # FEI eligibility (+20%)
+        # FEI eligibility (+25%) - Strategic priority per Alter-5 business model
         if candidate.fei_status == "Eligible":
-            score += SCORE_WEIGHTS["fei_eligible"]
-            breakdown["fei_eligible"] = SCORE_WEIGHTS["fei_eligible"]
+            fei_weight = SCORE_WEIGHTS["fei_eligible"]
+            if prioritize_fei:
+                fei_weight *= 1.2  # Additional 20% boost when prioritizing FEI
+            score += fei_weight
+            breakdown["fei_eligible"] = fei_weight
+        
+        # FEI green certificates (+10%) - ISO 14001, EcoLabel, etc.
+        if candidate.has_green_certificates():
+            score += SCORE_WEIGHTS["fei_has_certificates"]
+            breakdown["fei_has_certificates"] = SCORE_WEIGHTS["fei_has_certificates"]
         
         # Key person identified (+15%)
         if candidate.has_key_person:
-            score += SCORE_WEIGHTS["key_person_identified"]
-            breakdown["key_person_identified"] = SCORE_WEIGHTS["key_person_identified"]
+            weight = SCORE_WEIGHTS["key_person_identified"]
+            # Bonus if key person has LinkedIn profile
+            if candidate.key_person_linkedin:
+                weight *= 1.1
+            score += weight
+            breakdown["key_person_identified"] = weight
         
-        # Sector match (+15%)
+        # Sector match (+12%)
         if candidate.sector and candidate.sector in affected_sectors:
             score += SCORE_WEIGHTS["sector_match"]
             breakdown["sector_match"] = SCORE_WEIGHTS["sector_match"]
         
-        # Country match (+10%)
+        # Country match (+8%)
         if candidate.country and candidate.country in affected_countries:
             score += SCORE_WEIGHTS["country_match"]
             breakdown["country_match"] = SCORE_WEIGHTS["country_match"]
         
-        # Financials complete (+10%)
+        # Financials complete (+8%)
         if candidate.has_financials:
             score += SCORE_WEIGHTS["financials_complete"]
             breakdown["financials_complete"] = SCORE_WEIGHTS["financials_complete"]
         
         # Positive engagement (+10%)
-        if candidate.previous_engagement and "positive" in candidate.previous_engagement.lower():
-            score += SCORE_WEIGHTS["positive_engagement"]
-            breakdown["positive_engagement"] = SCORE_WEIGHTS["positive_engagement"]
+        if candidate.previous_engagement:
+            engagement_lower = candidate.previous_engagement.lower()
+            if "positive" in engagement_lower or "interested" in engagement_lower:
+                score += SCORE_WEIGHTS["positive_engagement"]
+                breakdown["positive_engagement"] = SCORE_WEIGHTS["positive_engagement"]
+        
+        # LinkedIn data available (+7%)
+        if candidate.has_linkedin_data:
+            score += SCORE_WEIGHTS["linkedin_data"]
+            breakdown["linkedin_data"] = SCORE_WEIGHTS["linkedin_data"]
+        
+        # Recent activity bonus (+5%) - LinkedIn posts in last 30 days
+        if candidate.recent_linkedin_posts:
+            score += SCORE_WEIGHTS["recent_activity"]
+            breakdown["recent_activity"] = SCORE_WEIGHTS["recent_activity"]
         
         # Clamp to 0-1 range
         candidate.fit_score = min(1.0, max(0.0, score))

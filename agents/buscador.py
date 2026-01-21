@@ -55,7 +55,9 @@ URL_TIMEOUT_SECONDS = 5
 # Similarity threshold for deduplication
 SIMILARITY_THRESHOLD = 0.90
 
-# Default source for AI-found companies
+# Default source for AI-found companies (aligned with tests and Airtable options)
+# Valid options: Research, Internal Referral, AI_Scraping, Web Scraping, Web Form,
+# Partner Referral, LinkedIn Outreach, Event, CRM Migration, Phone Call, Other
 DEFAULT_SOURCE = "AI_Scraping"
 
 # Default business unit name
@@ -112,6 +114,7 @@ class CompanyCandidate:
     """A candidate company found during search."""
     name: str
     home_url: Optional[str] = None
+    linkedin_url: Optional[str] = None
     description: Optional[str] = None
     sector: Optional[str] = None
     country: Optional[str] = None
@@ -279,6 +282,13 @@ class BuscadorEmpresas:
             
             # Step 1: Search with Gemini
             query = self._build_search_query(criteria)
+            
+            logger.debug(
+                "search_query_built",
+                task_id=task_id,
+                query=query,
+            )
+            
             candidates = self._search_companies(query, criteria.limit)
             result.candidates_found = candidates
             
@@ -292,9 +302,10 @@ class BuscadorEmpresas:
                 result.errors.append("No companies found matching criteria")
                 return result
             
-            # Step 2: Verify URLs
+            # Step 2: Verify URLs and refine data
             if verify_urls:
                 self._verify_urls(candidates)
+                self._refine_candidates(candidates, criteria)
                 result.candidates_verified = sum(1 for c in candidates if c.url_verified)
                 
                 logger.info(
@@ -389,36 +400,38 @@ class BuscadorEmpresas:
         Returns:
             Formatted search query string
         """
-        query_parts = []
+        # Get country name
+        country_name = self._get_country_name(criteria.country) if criteria.country else None
         
-        # Main sector query
-        if criteria.sector:
-            query_parts.append(f"listado de empresas de {criteria.sector}")
+        # Build main query - be very explicit about country
+        if criteria.sector and country_name:
+            query = f"Busca {criteria.limit} empresas del sector {criteria.sector} que estén ubicadas en {country_name}"
+        elif criteria.sector:
+            query = f"Busca {criteria.limit} empresas del sector {criteria.sector}"
+        elif country_name:
+            query = f"Busca {criteria.limit} empresas ubicadas en {country_name}"
         else:
-            query_parts.append("listado de empresas")
+            query = f"Busca {criteria.limit} empresas"
         
-        # Location
+        # Add region if specified
         if criteria.region:
-            query_parts.append(f"en {criteria.region}")
-        if criteria.country:
-            country_name = self._get_country_name(criteria.country)
-            query_parts.append(f"de {country_name}")
+            query += f", específicamente en la región de {criteria.region}"
         
-        # Size
+        # Add size filter
         if criteria.min_employees:
-            query_parts.append(f"con más de {criteria.min_employees} empleados")
+            query += f", con más de {criteria.min_employees} empleados"
         
-        # Keywords
+        # Add keywords
         if criteria.keywords:
-            query_parts.append(f"especializadas en {', '.join(criteria.keywords)}")
+            query += f", especializadas en {', '.join(criteria.keywords)}"
         
-        # Request structure
-        query_parts.append(
-            "Incluir nombre de empresa, página web, y breve descripción. "
-            "Solo empresas reales que existan actualmente."
-        )
+        # Emphasize country requirement
+        if country_name:
+            query += f". IMPORTANTE: Solo empresas con sede en {country_name} (código de país: {criteria.country})"
         
-        return " ".join(query_parts)
+        query += ". Solo empresas reales con sitio web verificable."
+        
+        return query
     
     def _get_country_name(self, country_code: str) -> str:
         """Convert country code to full name.
@@ -436,12 +449,25 @@ class BuscadorEmpresas:
             "DE": "Alemania",
             "IT": "Italia",
             "UK": "Reino Unido",
+            "GB": "Reino Unido",
+            "IE": "Irlanda",
+            "NL": "Países Bajos",
+            "BE": "Bélgica",
+            "CH": "Suiza",
+            "AT": "Austria",
+            "PL": "Polonia",
+            "SE": "Suecia",
+            "NO": "Noruega",
+            "DK": "Dinamarca",
+            "FI": "Finlandia",
             "US": "Estados Unidos",
+            "CA": "Canadá",
             "MX": "México",
             "BR": "Brasil",
             "AR": "Argentina",
             "CL": "Chile",
             "CO": "Colombia",
+            "PE": "Perú",
         }
         return country_names.get(country_code.upper(), country_code)
     
@@ -462,28 +488,33 @@ class BuscadorEmpresas:
         prompt = f"""
 {query}
 
-Encuentra hasta {limit} empresas reales que cumplan estos criterios.
+REQUISITOS ESTRICTOS:
+1. Encuentra EXACTAMENTE {limit} empresas diferentes (o todas las que existan si hay menos)
+2. TODAS las empresas DEBEN estar ubicadas en el país especificado en la búsqueda
+3. NO incluir empresas de otros países
 
 Para cada empresa encontrada, proporciona la información en formato JSON:
 {{
-    "companies": [
+            "companies": [
         {{
             "name": "Nombre exacto de la empresa",
             "home_url": "https://www.ejemplo.com",
+            "linkedin_url": "https://www.linkedin.com/company/...",
             "description": "Breve descripción de la actividad",
             "sector": "Sector de actividad",
-            "country": "Código de país (ES, PT, etc.)",
-            "region": "Región/Comunidad Autónoma",
+            "country": "Código de país ISO (ES, IE, PT, DE, etc.)",
+            "region": "Región o ciudad",
             "estimated_employees": 100
         }}
     ]
 }}
 
-IMPORTANTE:
-- Solo incluir empresas REALES con sitio web verificable
+REGLAS:
+- Solo empresas REALES con sitio web verificable
 - La URL debe ser la página principal de la empresa
-- No inventar empresas ni URLs
-- Si no encuentras {limit} empresas, incluir solo las que encuentres
+- NO inventar empresas ni URLs
+- Incluir las {limit} empresas más relevantes del sector
+- El código de país DEBE coincidir con el país solicitado
 """
         
         try:
@@ -505,10 +536,11 @@ Extract the company information from this text and return as JSON:
 
 Return ONLY valid JSON in this exact format:
 {{
-    "companies": [
+            "companies": [
         {{
             "name": "Company Name",
             "home_url": "https://...",
+            "linkedin_url": "https://www.linkedin.com/company/...",
             "description": "...",
             "sector": "...",
             "country": "ES",
@@ -527,6 +559,7 @@ Return ONLY valid JSON in this exact format:
                 candidate = CompanyCandidate(
                     name=company_data.get("name", "Unknown"),
                     home_url=company_data.get("home_url"),
+                    linkedin_url=company_data.get("linkedin_url"),
                     description=company_data.get("description"),
                     sector=company_data.get("sector"),
                     country=company_data.get("country"),
@@ -553,32 +586,142 @@ Return ONLY valid JSON in this exact format:
             candidates: List of candidates to verify
         """
         for candidate in candidates:
-            if not candidate.home_url:
-                candidate.url_verified = False
+            verified, final_url = self._verify_single_url(candidate.home_url)
+            candidate.url_verified = verified
+            if final_url:
+                candidate.home_url = final_url
+
+    def _normalize_url(self, url: Optional[str]) -> Optional[str]:
+        """Normalize URL for verification."""
+        if not url:
+            return None
+        cleaned = url.strip()
+        if not cleaned:
+            return None
+        if not cleaned.startswith(("http://", "https://")):
+            cleaned = f"https://{cleaned}"
+        return cleaned.rstrip("/")
+
+    def _verify_single_url(self, url: Optional[str]) -> tuple[bool, Optional[str]]:
+        """Verify a single URL and return (is_valid, final_url)."""
+        normalized = self._normalize_url(url)
+        if not normalized:
+            return False, None
+        try:
+            with httpx.Client(timeout=URL_TIMEOUT_SECONDS, follow_redirects=True) as client:
+                response = client.head(normalized)
+                if response.status_code >= 400:
+                    response = client.get(normalized)
+                is_valid = response.status_code < 400
+                final_url = str(response.url) if is_valid else normalized
+                return is_valid, final_url
+        except Exception as e:
+            logger.debug(
+                "url_verification_failed",
+                url=normalized,
+                error=str(e),
+            )
+            return False, normalized
+
+    def _is_probable_official_url(self, company_name: str, url: Optional[str]) -> bool:
+        """Check whether a URL likely belongs to the company."""
+        if not url or not company_name:
+            return False
+        domain = self._extract_domain(url) or ""
+        if not domain:
+            return False
+        name = re.sub(r"[^\w\s]", " ", company_name.lower())
+        name = re.sub(r"\b(s\.l\.|sl|s\.a\.|sa|ltd|inc|gmbh|bv|srl|plc|llc)\b", "", name)
+        tokens = [t for t in name.split() if len(t) >= 3]
+        if not tokens:
+            return True
+        return any(token in domain for token in tokens)
+
+    def _resolve_official_url(
+        self,
+        company_name: str,
+        country: Optional[str],
+        region: Optional[str],
+    ) -> dict[str, Any]:
+        """Find official website and key metadata for a company."""
+        country_name = self._get_country_name(country) if country else None
+        region_text = f" en {region}" if region else ""
+        location_hint = f"{country_name}{region_text}" if country_name else ""
+
+        prompt = f"""
+Encuentra el sitio web OFICIAL de la empresa "{company_name}" {f"({location_hint})" if location_hint else ""}.
+Devuelve SOLO un JSON con esta estructura:
+{{
+  "website": "https://www.ejemplo.com",
+  "linkedin_url": "https://www.linkedin.com/company/...",
+  "description": "Descripción breve",
+  "sector": "Sector",
+  "country": "{country or ''}",
+  "region": "{region or ''}",
+  "estimated_employees": 100
+}}
+
+REGLAS:
+- Usa SOLO el sitio web oficial (dominio propio).
+- Si hay dudas, devuelve el candidato más probable.
+"""
+        response = self._gemini.search_and_generate(
+            query=prompt,
+            system_prompt=self._system_prompt,
+        )
+        result = self._gemini.generate_json(
+            prompt=f"Extrae y devuelve SOLO el JSON:\n\n{response.get('response', '')}",
+        )
+        return result if isinstance(result, dict) else {}
+
+    def _refine_candidates(
+        self,
+        candidates: list[CompanyCandidate],
+        criteria: SearchCriteria,
+    ) -> None:
+        """Improve URLs and metadata using additional verification/search."""
+        for candidate in candidates:
+            needs_url = not candidate.home_url or not candidate.url_verified
+            plausible_url = self._is_probable_official_url(candidate.name, candidate.home_url)
+            needs_profile = not candidate.description or not candidate.sector or not candidate.estimated_employees
+            needs_linkedin = not candidate.linkedin_url
+
+            if not needs_url and plausible_url and not needs_profile and not needs_linkedin:
                 continue
-            
+
             try:
-                # Normalize URL
-                url = candidate.home_url
-                if not url.startswith(("http://", "https://")):
-                    url = f"https://{url}"
-                
-                # Make HEAD request with timeout
-                with httpx.Client(timeout=URL_TIMEOUT_SECONDS, follow_redirects=True) as client:
-                    response = client.head(url)
-                    candidate.url_verified = response.status_code < 400
-                    
-                    # Update URL if it was redirected
-                    if response.status_code == 200:
-                        candidate.home_url = str(response.url)
-                        
-            except Exception as e:
-                logger.debug(
-                    "url_verification_failed",
-                    url=candidate.home_url,
-                    error=str(e),
+                profile = self._resolve_official_url(
+                    company_name=candidate.name,
+                    country=criteria.country,
+                    region=criteria.region,
                 )
-                candidate.url_verified = False
+            except Exception as e:
+                logger.debug("url_resolution_failed", company=candidate.name, error=str(e))
+                continue
+
+            website = profile.get("website")
+            linkedin_url = profile.get("linkedin_url")
+            description = profile.get("description")
+            sector = profile.get("sector")
+            region = profile.get("region")
+            employees = profile.get("estimated_employees")
+
+            if website:
+                verified, final_url = self._verify_single_url(website)
+                candidate.url_verified = verified
+                if final_url:
+                    candidate.home_url = final_url
+
+            if linkedin_url and not candidate.linkedin_url:
+                candidate.linkedin_url = linkedin_url
+            if description and not candidate.description:
+                candidate.description = description
+            if sector and not candidate.sector:
+                candidate.sector = sector
+            if region and not candidate.region:
+                candidate.region = region
+            if employees and not candidate.estimated_employees:
+                candidate.estimated_employees = employees
     
     def _deduplicate(self, candidates: list[CompanyCandidate]) -> None:
         """Check candidates against existing companies in database.
@@ -617,7 +760,7 @@ Return ONLY valid JSON in this exact format:
                 existing_names[name] = company_id
             
             # Domain lookup
-            home_url = fields.get("Home_URL", "")
+            home_url = fields.get("Home URL") or fields.get("Home_URL", "")
             if home_url:
                 domain = self._extract_domain(home_url)
                 if domain:
@@ -680,42 +823,34 @@ Return ONLY valid JSON in this exact format:
             Tuple of (company_id, bu_id)
         """
         # Create Company record
+        # NOTE: Only use writable fields from Stakeholders_Companies table
+        # - Sector is a Rollup (read-only, populated from Business Units)
+        # - HQ Country is a Link (would need record ID)
         company_fields = {
             "Company Name": candidate.name,
             "Source": DEFAULT_SOURCE,
-            "Record_Status": "Active",
         }
         
         if candidate.home_url:
-            company_fields["Home_URL"] = candidate.home_url
+            company_fields["Home URL"] = candidate.home_url
         
         if candidate.description:
             company_fields["Description"] = candidate.description
         
-        if candidate.sector:
-            company_fields["Sector"] = candidate.sector
-        
-        if candidate.country:
-            company_fields["Country"] = candidate.country
-        
+        # Num Employees is a Number field (with space, not underscore)
         if candidate.estimated_employees:
-            company_fields["Num_Employees"] = candidate.estimated_employees
+            company_fields["Num Employees"] = candidate.estimated_employees
         
         company_record = self._airtable.create_record("companies", company_fields)
         company_id = company_record["id"]
         
         # Create default Business Unit
+        # NOTE: Sector and Focus Countries are Link fields (would need record IDs)
+        # For now, just create with basic fields
         bu_fields = {
             "Business Unit Name": DEFAULT_BU_NAME,
             "Company": [company_id],
-            "Record_Status": "Active",
         }
-        
-        if candidate.sector:
-            bu_fields["Sector"] = candidate.sector
-        
-        if candidate.country:
-            bu_fields["Country"] = candidate.country
         
         bu_record = self._airtable.create_record("business_units", bu_fields)
         bu_id = bu_record["id"]

@@ -1,57 +1,92 @@
 # =============================================================================
-# Motor de Originación Alter-5 - Requirements
+# Motor de Originación Alter-5 - Requirements v2.0
 # =============================================================================
 # Python >= 3.11 requerido
-# Fecha: 2 Enero 2026
+# Actualizado: 19 Enero 2026
 # =============================================================================
 
 # -----------------------------------------------------------------------------
 # CORE: APIs de LLMs
 # -----------------------------------------------------------------------------
-anthropic==0.40.0           # Claude API - versión estable con soporte Messages API
-google-generativeai==0.8.3  # Gemini API - incluye Search Grounding
+anthropic>=0.40.0           # Claude API - versión estable con soporte Messages API
+google-generativeai>=0.8.3  # Gemini API - incluye Search Grounding
+openai>=1.10.0              # OpenAI API - para embeddings
 
 # -----------------------------------------------------------------------------
 # CORE: Base de Datos y Validación
 # -----------------------------------------------------------------------------
-pyairtable==2.3.3           # Cliente Airtable oficial
-pydantic==2.10.3            # Validación de datos y modelos
-pydantic-settings==2.6.1    # Gestión de configuración desde .env
+pyairtable>=2.3.3           # Cliente Airtable oficial
+pydantic>=2.10.3            # Validación de datos y modelos
+pydantic-settings>=2.6.1    # Gestión de configuración desde .env
+pymongo>=4.6.0              # MongoDB client para cache
 
 # -----------------------------------------------------------------------------
 # CORE: HTTP y Resilencia
 # -----------------------------------------------------------------------------
-httpx==0.28.1               # Cliente HTTP async moderno
-tenacity==9.0.0             # Retry logic para APIs
-aiohttp==3.11.11            # Async HTTP (dependencia de google-generativeai)
+httpx>=0.28.1               # Cliente HTTP async moderno
+tenacity>=9.0.0             # Retry logic para APIs
+aiohttp>=3.11.11            # Async HTTP (dependencia de google-generativeai)
+
+# -----------------------------------------------------------------------------
+# Frontend (Streamlit)
+# -----------------------------------------------------------------------------
+streamlit>=1.30.0           # Dashboard UI framework
+
+# -----------------------------------------------------------------------------
+# Web Scraping
+# -----------------------------------------------------------------------------
+playwright>=1.40.0          # Browser automation para scraping
+trafilatura>=1.6.0          # Content extraction
+
+# -----------------------------------------------------------------------------
+# Task Queue & Scheduling
+# -----------------------------------------------------------------------------
+celery>=5.3.0               # Distributed task queue
+redis>=5.0.0                # Redis client para Celery broker
+apscheduler>=3.10.4         # Scheduler para tareas programadas
+
+# -----------------------------------------------------------------------------
+# API Server
+# -----------------------------------------------------------------------------
+fastapi>=0.109.0            # API framework
+uvicorn>=0.27.0             # ASGI server
+
+# -----------------------------------------------------------------------------
+# Notifications
+# -----------------------------------------------------------------------------
+slack-sdk>=3.26.0           # Slack client para alertas
+
+# -----------------------------------------------------------------------------
+# Data Processing
+# -----------------------------------------------------------------------------
+feedparser>=6.0.0           # RSS feed parsing
+pandas>=2.0.0               # Data manipulation (usado por Streamlit)
+
+# -----------------------------------------------------------------------------
+# ML (Phase 4)
+# -----------------------------------------------------------------------------
+# xgboost>=2.0.0            # ML model para scoring
+# scikit-learn>=1.4.0       # ML utilities
+# pinecone-client>=3.0.0    # Vector database
 
 # -----------------------------------------------------------------------------
 # CLI y Logging
 # -----------------------------------------------------------------------------
-typer==0.9.0                # CLI framework moderno (pinned for click compatibility)
-click==8.1.7                # Command line toolkit (pinned for typer compatibility)
-rich==13.9.4                # Output enriquecido para CLI (dependencia de typer)
-structlog==24.4.0           # Logging estructurado
+typer>=0.9.0                # CLI framework moderno
+click>=8.1.7                # Command line toolkit (pinned for typer compatibility)
+rich>=13.9.4                # Output enriquecido para CLI
+structlog>=24.4.0           # Logging estructurado
 
 # -----------------------------------------------------------------------------
 # Utilidades
 # -----------------------------------------------------------------------------
-python-dotenv==1.0.1        # Carga de variables de entorno
-python-dateutil==2.9.0      # Manipulación de fechas
-
-# -----------------------------------------------------------------------------
-# DESARROLLO (opcional - instalar con: pip install -r requirements-dev.txt)
-# -----------------------------------------------------------------------------
-# pytest==8.3.4
-# pytest-cov==6.0.0
-# pytest-asyncio==0.24.0
-# ruff==0.8.4
-# mypy==1.14.0
+python-dotenv>=1.0.1        # Carga de variables de entorno
+python-dateutil>=2.9.0      # Manipulación de fechas
 
 # =============================================================================
 # INSTALACIÓN:
 # 1. Crear entorno virtual: python -m venv venv
-# 2. Activar entorno: source venv/bin/activate (Mac/Linux) o venv\Scripts\activate (Windows)
+# 2. Activar entorno: source venv/bin/activate (Mac/Linux)
 # 3. Instalar: pip install -r requirements.txt
+# 4. Instalar browsers: playwright install chromium
 # =============================================================================
-

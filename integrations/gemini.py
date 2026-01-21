@@ -92,16 +92,22 @@ class GeminiClient:
             },
         )
         
-        # Model with search grounding
-        self._search_model = genai.GenerativeModel(
-            model_name=self.model_name,
-            generation_config=GenerationConfig(
-                temperature=0.3,  # Lower for factual search
-                top_p=0.95,
-                max_output_tokens=8192,
-            ),
-            tools="google_search_retrieval",
-        )
+        # Model with search grounding (use google_search for 2.0+ models)
+        try:
+            from google.generativeai.types import Tool
+            # For Gemini 2.0+ use google_search tool
+            self._search_model = genai.GenerativeModel(
+                model_name=self.model_name,
+                generation_config=GenerationConfig(
+                    temperature=0.3,  # Lower for factual search
+                    top_p=0.95,
+                    max_output_tokens=8192,
+                ),
+                tools=[Tool(google_search={})],
+            )
+        except Exception:
+            # Fallback: use regular model for search (without grounding)
+            self._search_model = self._model
         
         logger.info(
             "gemini_client_initialized",

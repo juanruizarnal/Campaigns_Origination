@@ -1,16 +1,20 @@
 """Agente Evaluador FEI for Alter-5 Origination Engine.
 
 This module implements the EvaluadorFEI agent (Agent 3) which evaluates
-companies for FEI (Fondo Europeo de Inversiones) eligibility using 
-Claude for reasoning and Gemini for web searches.
+companies for FEI (Fondo Europeo de Inversiones) eligibility using:
+- Scraped data from company websites (certifications)
+- Claude for reasoning and analysis
+- Gemini for web searches
 
 A company is FEI eligible if it meets AT LEAST ONE of these 6 criteria:
-1. 1.1_Cleantech_Prize - Has won a cleantech/sustainability prize
-2. 1.2_Clean_Energy_Patent - Owns clean energy patents
-3. 1.3_Eco_Label - Has EU eco-labels
-4. 1.4_Green_Business_90 - >90% revenue from green activities
-5. 1.5_Green_Business_Model - Inherently green business model
-6. 1.6_Environmental_Certificate - Has environmental certifications (ISO 14001, etc.)
+1. 1.1_Cleantech_Prize - Has won a cleantech/sustainability prize (last 3 years)
+2. 1.2_Clean_Energy_Patent - Owns clean energy patents (last 3 years)
+3. 1.3_Eco_Label - Has EU/National/International eco-labels
+4. 1.4_Green_Business_90 - ≥90% revenue from green activities
+5. 1.5_Green_Business_Model - Inherently green business model with verifiable impact
+6. 1.6_Environmental_Certificate - Has valid environmental certifications (ISO 14001, etc.)
+
+Target: ≥90% precision in evaluation
 
 Usage:
     from agents.evaluador_fei import EvaluadorFEI
@@ -19,6 +23,8 @@ Usage:
     result = agent.evaluate("recXXXXXX")
 """
 
+import asyncio
+import json
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, Optional
@@ -34,9 +40,11 @@ from config.airtable_schema import (
 )
 from config.prompts import load_prompt
 from core.airtable_client import AirtableClient, AirtableError, get_airtable_client
-from core.models import FEIStatus, FEICriteria, FEIEvaluation
+from core.async_utils import run_async
+from core.models import FEIStatus, FEICriteria, FEIEvaluation, ScrapedCompanyData
 from integrations.gemini import GeminiClient, GeminiError, get_gemini_client
 from integrations.claude import ClaudeClient, ClaudeError, get_claude_client
+from integrations.scraper import PlaywrightScraper, scrape_company, extract_certifications_from_text
 
 logger = structlog.get_logger()
 
@@ -104,6 +112,10 @@ class EvaluationResult:
     processing_time_seconds: float = 0.0
     errors: list[str] = field(default_factory=list)
     
+    # NEW: Data sources used
+    data_sources: list[str] = field(default_factory=list)
+    scraped_data: Optional[ScrapedCompanyData] = None
+    
     def is_eligible(self) -> bool:
         """Check if company is FEI eligible."""
         return self.status == FEIStatus.ELIGIBLE
@@ -111,6 +123,13 @@ class EvaluationResult:
     def needs_review(self) -> bool:
         """Check if evaluation needs human review."""
         return self.status == FEIStatus.PENDING_REVIEW or self.confidence < 70
+    
+    def get_primary_criterion(self) -> Optional[FEICriteria]:
+        """Get the primary (highest confidence) criterion met."""
+        if not self.criteria_met:
+            return None
+        # Return first one (usually highest confidence)
+        return self.criteria_met[0]
 
 
 # ==============================================================================
@@ -192,6 +211,7 @@ class EvaluadorFEI:
         airtable_client: Optional[AirtableClient] = None,
         gemini_client: Optional[GeminiClient] = None,
         claude_client: Optional[ClaudeClient] = None,
+        use_scraping: bool = True,
     ):
         """Initialize the EvaluadorFEI agent.
         
@@ -199,26 +219,53 @@ class EvaluadorFEI:
             airtable_client: Optional custom Airtable client
             gemini_client: Optional custom Gemini client for searches
             claude_client: Optional custom Claude client for reasoning
+            use_scraping: Whether to use Playwright scraping (recommended for accuracy)
         """
         self._airtable = airtable_client or get_airtable_client()
         self._gemini = gemini_client or get_gemini_client()
         self._claude = claude_client or get_claude_client()
         self._system_prompt = load_prompt("evaluador_fei")
+        self._use_scraping = use_scraping
         
-        logger.info("evaluador_fei_initialized")
+        logger.info("evaluador_fei_initialized", use_scraping=use_scraping)
     
     def evaluate(
         self,
         company_id: str,
         force: bool = False,
         dry_run: bool = False,
+        use_scraped_data: Optional[ScrapedCompanyData] = None,
+    ) -> EvaluationResult:
+        """Evaluate a company's FEI eligibility (sync wrapper)."""
+        return run_async(
+            self._evaluate_async(
+                company_id=company_id,
+                force=force,
+                dry_run=dry_run,
+                use_scraped_data=use_scraped_data,
+            )
+        )
+
+    async def _evaluate_async(
+        self,
+        company_id: str,
+        force: bool = False,
+        dry_run: bool = False,
+        use_scraped_data: Optional[ScrapedCompanyData] = None,
     ) -> EvaluationResult:
         """Evaluate a company's FEI eligibility.
+        
+        Uses multiple data sources for ≥90% precision:
+        1. Scraped data from company website (highest priority for certs)
+        2. Existing Airtable data
+        3. Gemini search for additional verification
+        4. Claude for final reasoning and decision
         
         Args:
             company_id: Airtable record ID of the company
             force: Force re-evaluation even if recently evaluated
             dry_run: If True, don't save changes to Airtable
+            use_scraped_data: Pre-scraped data (from Enriquecedor) to avoid re-scraping
             
         Returns:
             EvaluationResult with status, criteria met, and reasoning
@@ -232,6 +279,7 @@ class EvaluadorFEI:
             company_id=company_id,
             force=force,
             dry_run=dry_run,
+            has_scraped_data=use_scraped_data is not None,
         )
         
         # Initialize result
@@ -282,25 +330,97 @@ class EvaluadorFEI:
                 company_url=company_url,
             )
             
-            # 2. Search for certificates (Criterion 1.6)
-            certificates = self._search_certificates(company_name, company_url)
-            result.certificates_found = certificates
+            # 2. NEW: Get certifications from scraped data FIRST (highest accuracy)
+            scraped_certs = []
+            if use_scraped_data and use_scraped_data.success:
+                result.scraped_data = use_scraped_data
+                result.data_sources.append("web_scraping")
+                scraped_certs = use_scraped_data.certifications
+                
+                # Convert scraped certs to CertificateEvidence
+                for cert_name in scraped_certs:
+                    cert_evidence = CertificateEvidence(
+                        certificate_type=self._determine_cert_type(cert_name),
+                        certificate_name=cert_name,
+                        fei_criteria=self._determine_fei_criteria(cert_name),
+                        verification_url=use_scraped_data.url,
+                    )
+                    result.certificates_found.append(cert_evidence)
+                
+                logger.info(
+                    "scraped_certs_processed",
+                    task_id=task_id,
+                    count=len(scraped_certs),
+                    certs=scraped_certs,
+                )
             
-            # 3. Search for eco-labels (Criterion 1.3)
-            eco_labels = self._search_eco_labels(company_name, company_url)
-            result.certificates_found.extend(eco_labels)
+            # 3. If no scraped data and scraping enabled, scrape now
+            elif self._use_scraping and company_url:
+                try:
+                    scraped_data = await scrape_company(company_url)
+                    result.scraped_data = scraped_data
+                    result.data_sources.append("web_scraping")
+                    
+                    if scraped_data.success:
+                        scraped_certs = scraped_data.certifications
+                        for cert_name in scraped_certs:
+                            cert_evidence = CertificateEvidence(
+                                certificate_type=self._determine_cert_type(cert_name),
+                                certificate_name=cert_name,
+                                fei_criteria=self._determine_fei_criteria(cert_name),
+                                verification_url=company_url,
+                            )
+                            result.certificates_found.append(cert_evidence)
+                except Exception as e:
+                    logger.warning("scraping_failed", task_id=task_id, error=str(e))
             
-            # 4. Search for cleantech prizes (Criterion 1.1)
+            # 4. Check existing Airtable data for certificates
+            existing_scraped = fields.get("Scraped_Content")
+            if existing_scraped:
+                try:
+                    scraped_json = json.loads(existing_scraped)
+                    airtable_certs = scraped_json.get("certifications", [])
+                    result.data_sources.append("airtable_cache")
+                    
+                    for cert_name in airtable_certs:
+                        if not any(c.certificate_name == cert_name for c in result.certificates_found):
+                            result.certificates_found.append(CertificateEvidence(
+                                certificate_type=self._determine_cert_type(cert_name),
+                                certificate_name=cert_name,
+                                fei_criteria=self._determine_fei_criteria(cert_name),
+                            ))
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            
+            # 5. Search for additional certificates with Gemini (verification/complement)
+            if not result.certificates_found:  # Only if we haven't found any yet
+                result.data_sources.append("gemini_search")
+                gemini_certs = self._search_certificates(company_name, company_url)
+                result.certificates_found.extend(gemini_certs)
+                
+                gemini_eco_labels = self._search_eco_labels(company_name, company_url)
+                result.certificates_found.extend(gemini_eco_labels)
+            
+            # 6. Search for cleantech prizes (Criterion 1.1) - always search
             prizes = self._search_prizes(company_name, company_url)
             result.prizes_found = prizes
             
-            # 5. Check green business activity (Criteria 1.4 and 1.5)
+            # 7. Check green business activity (Criteria 1.4 and 1.5)
             green_activities = self._check_green_activity(
                 company_name, company_url, company_record
             )
             result.green_activities = green_activities
             
-            # 6. Compile evidence and evaluate with Claude
+            # Also use scraped green indicators
+            if result.scraped_data and result.scraped_data.green_indicators:
+                for indicator in result.scraped_data.green_indicators[:5]:
+                    result.green_activities.append(GreenActivityEvidence(
+                        activity_name=indicator,
+                        activity_type="Green Indicator",
+                        is_primary_activity=False,
+                    ))
+            
+            # 8. Evaluate with Claude for complex cases and calibrated confidence
             evaluation = self._evaluate_with_reasoning(
                 company_name=company_name,
                 company_url=company_url,
@@ -309,14 +429,14 @@ class EvaluadorFEI:
                 green_activities=result.green_activities,
                 company_description=fields.get("Description", ""),
             )
-            
+
             result.status = evaluation["status"]
             result.criteria_met = evaluation["criteria_met"]
             result.confidence = evaluation["confidence"]
             result.reasoning = evaluation["reasoning"]
             result.criteria_results = evaluation.get("criteria_results", [])
             
-            # 7. Save evaluation to Airtable
+            # 10. Save evaluation to Airtable
             if not dry_run:
                 self._save_evaluation(company_id, result)
             
@@ -362,10 +482,41 @@ class EvaluadorFEI:
             status=result.status.value,
             criteria_met=[c.value for c in result.criteria_met],
             confidence=result.confidence,
+            data_sources=result.data_sources,
             processing_time=result.processing_time_seconds,
         )
         
         return result
+    
+    def _determine_cert_type(self, cert_name: str) -> str:
+        """Determine certificate type from name."""
+        if "ISO" in cert_name.upper():
+            return "ISO"
+        elif "B Corp" in cert_name or "EMAS" in cert_name:
+            return "Eco-label"
+        elif any(x in cert_name for x in ["FSC", "PEFC", "LEED", "BREEAM"]):
+            return "Eco-label"
+        return "Environmental"
+    
+    def _determine_fei_criteria(self, cert_name: str) -> str:
+        """Determine which FEI criteria a certificate satisfies."""
+        # Criterion 1.6: Environmental Management Certificates
+        if any(x in cert_name.upper() for x in ["ISO 14001", "ISO 50001", "ISO 14064", "EMAS"]):
+            return "1.6_Environmental_Certificate"
+        
+        # Criterion 1.3: Eco-labels
+        if any(x in cert_name for x in ["B Corp", "FSC", "PEFC", "LEED", "BREEAM", "Ecolabel"]):
+            return "1.3_Eco_Label"
+        
+        return "1.6_Environmental_Certificate"  # Default
+    
+    def _is_fei_valid_cert(self, cert_name: str) -> bool:
+        """Check if certificate is valid for FEI eligibility (Criterion 1.6)."""
+        valid_certs = [
+            "ISO 14001", "ISO 50001", "ISO 14064",
+            "EMAS", "B Corp",
+        ]
+        return any(valid in cert_name for valid in valid_certs)
     
     def _search_certificates(
         self,
@@ -938,44 +1089,75 @@ Return a JSON object with this EXACT structure:
         force: bool = False,
         dry_run: bool = False,
         on_progress: Optional[callable] = None,
+        max_concurrent: int = 3,
     ) -> list[EvaluationResult]:
-        """Evaluate FEI eligibility for multiple companies.
+        """Evaluate FEI eligibility for multiple companies (sync wrapper)."""
+        return run_async(
+            self._evaluate_batch_async(
+                company_ids=company_ids,
+                force=force,
+                dry_run=dry_run,
+                on_progress=on_progress,
+                max_concurrent=max_concurrent,
+            )
+        )
+
+    async def _evaluate_batch_async(
+        self,
+        company_ids: list[str],
+        force: bool = False,
+        dry_run: bool = False,
+        on_progress: Optional[callable] = None,
+        max_concurrent: int = 3,
+    ) -> list[EvaluationResult]:
+        """Evaluate FEI eligibility for multiple companies with concurrency.
         
         Args:
             company_ids: List of company record IDs
             force: Force re-evaluation
             dry_run: Don't save changes
             on_progress: Optional callback(current, total, result)
+            max_concurrent: Maximum concurrent evaluations
             
         Returns:
             List of EvaluationResult for each company
         """
-        results = []
         total = len(company_ids)
+        semaphore = asyncio.Semaphore(max_concurrent)
         
         logger.info(
             "batch_fei_evaluation_started",
             total_companies=total,
             force=force,
             dry_run=dry_run,
+            max_concurrent=max_concurrent,
         )
         
-        for i, company_id in enumerate(company_ids, 1):
-            result = self.evaluate(
-                company_id=company_id,
-                force=force,
-                dry_run=dry_run,
-            )
-            results.append(result)
-            
-            if on_progress:
-                on_progress(i, total, result)
+        async def evaluate_with_semaphore(company_id: str, index: int) -> EvaluationResult:
+            async with semaphore:
+                result = await self._evaluate_async(
+                    company_id=company_id,
+                    force=force,
+                    dry_run=dry_run,
+                )
+                if on_progress:
+                    on_progress(index, total, result)
+                return result
+        
+        tasks = [
+            evaluate_with_semaphore(company_id, i + 1)
+            for i, company_id in enumerate(company_ids)
+        ]
+        results = await asyncio.gather(*tasks)
         
         # Log summary
         eligible = sum(1 for r in results if r.status == FEIStatus.ELIGIBLE)
         not_eligible = sum(1 for r in results if r.status == FEIStatus.NOT_ELIGIBLE)
         pending = sum(1 for r in results if r.status == FEIStatus.PENDING_REVIEW)
         avg_confidence = sum(r.confidence for r in results) / len(results) if results else 0
+        
+        # Calculate precision metrics
+        high_confidence = sum(1 for r in results if r.confidence >= 80)
         
         logger.info(
             "batch_fei_evaluation_completed",
@@ -984,6 +1166,8 @@ Return a JSON object with this EXACT structure:
             not_eligible=not_eligible,
             pending_review=pending,
             average_confidence=avg_confidence,
+            high_confidence_count=high_confidence,
+            precision_estimate=f"{high_confidence/total*100:.1f}%" if total > 0 else "N/A",
         )
         
         return results

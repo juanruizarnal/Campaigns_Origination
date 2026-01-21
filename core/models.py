@@ -660,3 +660,246 @@ class EmailDraft(BaseModel):
             raise ValueError(f"Email body exceeds 150 words (has {word_count})")
         return v
 
+
+# ==============================================================================
+# SCRAPING MODELS (Fase 1-2)
+# ==============================================================================
+
+class ScrapedNewsItem(BaseModel):
+    """News item extracted from company website."""
+    title: str = Field(..., description="News headline")
+    published_date: Optional[date] = Field(None, description="Publication date")
+    summary: Optional[str] = Field(None, description="News summary")
+    url: Optional[str] = Field(None, description="Link to full article")
+
+
+class ScrapedContact(BaseModel):
+    """Contact information extracted from company website."""
+    name: Optional[str] = Field(None, description="Full name")
+    role: Optional[str] = Field(None, description="Job title/role")
+    email: Optional[str] = Field(None, description="Email address")
+    phone: Optional[str] = Field(None, description="Phone number")
+    linkedin_url: Optional[str] = Field(None, description="LinkedIn URL")
+
+
+class ScrapedCompanyData(BaseModel):
+    """Data extracted from scraping a company website.
+    
+    Used by Agente 1 (Buscador) to enrich company data.
+    """
+    url: str = Field(..., description="Website URL scraped")
+    scraped_at: datetime = Field(default_factory=datetime.now)
+    success: bool = Field(True, description="Whether scraping succeeded")
+    error_message: Optional[str] = Field(None, description="Error if failed")
+    
+    # Company info
+    activities: list[str] = Field(default_factory=list, description="Business activities")
+    sectors: list[str] = Field(default_factory=list, description="Detected sectors")
+    description: Optional[str] = Field(None, description="Company description")
+    
+    # Green/FEI related
+    certifications: list[str] = Field(
+        default_factory=list,
+        description="Certifications found (ISO 14001, etc.)"
+    )
+    green_indicators: list[str] = Field(
+        default_factory=list,
+        description="Sustainability/green indicators"
+    )
+    
+    # Size indicators
+    employee_count: Optional[int] = Field(None, ge=0)
+    employee_range: Optional[str] = Field(None, description="E.g., '50-200'")
+    
+    # Financial mentions
+    revenue_mentions: list[str] = Field(
+        default_factory=list,
+        description="Revenue/financial mentions"
+    )
+    
+    # News and updates
+    news_items: list[ScrapedNewsItem] = Field(
+        default_factory=list,
+        description="Recent news/press releases"
+    )
+    
+    # Contacts found
+    contacts: list[ScrapedContact] = Field(
+        default_factory=list,
+        description="Contacts found on website"
+    )
+    
+    # Social links
+    linkedin_url: Optional[str] = Field(None)
+    twitter_url: Optional[str] = Field(None)
+    
+    # Raw text for AI analysis
+    main_text: Optional[str] = Field(
+        None,
+        description="Main extracted text (for AI analysis)"
+    )
+
+
+# ==============================================================================
+# LINKEDIN DATA MODELS (Fase 2)
+# ==============================================================================
+
+class LinkedInCompanyData(BaseModel):
+    """Company data from LinkedIn via Proxycurl."""
+    linkedin_url: str = Field(..., description="LinkedIn company URL")
+    name: Optional[str] = Field(None)
+    description: Optional[str] = Field(None)
+    industry: Optional[str] = Field(None)
+    employee_count: Optional[int] = Field(None, ge=0)
+    employee_range: Optional[str] = Field(None)
+    founded_year: Optional[int] = Field(None)
+    specialties: list[str] = Field(default_factory=list)
+    website: Optional[str] = Field(None)
+    headquarters: Optional[str] = Field(None)
+    recent_posts: list[str] = Field(
+        default_factory=list,
+        description="Recent LinkedIn posts for personalization"
+    )
+
+
+class LinkedInPersonData(BaseModel):
+    """Person data from LinkedIn via Proxycurl."""
+    linkedin_url: str = Field(..., description="LinkedIn profile URL")
+    full_name: Optional[str] = Field(None)
+    first_name: Optional[str] = Field(None)
+    last_name: Optional[str] = Field(None)
+    headline: Optional[str] = Field(None, description="Current position")
+    summary: Optional[str] = Field(None, description="Profile summary")
+    location: Optional[str] = Field(None)
+    current_company: Optional[str] = Field(None)
+    current_role: Optional[str] = Field(None)
+    experiences: list[dict] = Field(default_factory=list)
+    recent_posts: list[str] = Field(
+        default_factory=list,
+        description="Recent posts for personalization"
+    )
+
+
+# ==============================================================================
+# TRIGGER DETECTION MODELS (Fase 4)
+# ==============================================================================
+
+class TriggerSource(str, Enum):
+    """Source type for trigger detection."""
+    RSS_FEED = "RSS_Feed"
+    TWITTER = "Twitter"
+    GOOGLE_ALERT = "Google_Alert"
+    NEWSLETTER = "Newsletter"
+    MANUAL = "Manual"
+
+
+class TriggerRelevance(str, Enum):
+    """Relevance level of detected trigger."""
+    HIGH = "High"  # >80%
+    MEDIUM = "Medium"  # 50-80%
+    LOW = "Low"  # <50%
+
+
+class DetectedTrigger(BaseModel):
+    """Market trigger detected by Agente 7 (Trigger Detector)."""
+    id: Optional[str] = Field(None, description="Airtable record ID")
+    
+    # Source
+    source: TriggerSource = Field(TriggerSource.RSS_FEED)
+    source_name: str = Field(..., description="E.g., 'Financial Times'")
+    source_url: str = Field(..., description="URL of the source")
+    
+    # Content
+    title: str = Field(..., description="Trigger headline")
+    summary: Optional[str] = Field(None, description="Brief summary")
+    content: Optional[str] = Field(None, description="Full content")
+    published_at: datetime = Field(default_factory=datetime.now)
+    
+    # Analysis
+    relevance_score: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description="Relevance score (0-1)"
+    )
+    relevance_level: TriggerRelevance = Field(TriggerRelevance.MEDIUM)
+    keywords_matched: list[str] = Field(default_factory=list)
+    
+    # Recommended action
+    recommended_action: Optional[str] = Field(
+        None,
+        description="E.g., 'create_campaign', 'notify', 'ignore'"
+    )
+    affected_sectors: list[str] = Field(default_factory=list)
+    affected_countries: list[str] = Field(default_factory=list)
+    recommended_products: list[str] = Field(default_factory=list)
+    
+    # Status
+    processed: bool = Field(False)
+    campaign_created: bool = Field(False)
+    campaign_id: Optional[str] = Field(None)
+
+
+# ==============================================================================
+# FOLLOW-UP MODELS (Fase 4)
+# ==============================================================================
+
+class FollowupAction(str, Enum):
+    """Action to take for follow-up."""
+    NONE = "none"
+    SCHEDULE_FOLLOWUP = "schedule_followup"
+    ALERT_HOT_LEAD = "alert_hot_lead"
+    ALERT_RESPONSE = "alert_response"
+    MARK_COLD = "mark_cold"
+
+
+class MailchimpEventType(str, Enum):
+    """Types of Mailchimp webhook events."""
+    SENT = "sent"
+    OPEN = "open"
+    CLICK = "click"
+    BOUNCE = "bounce"
+    UNSUBSCRIBE = "unsubscribe"
+    SPAM = "spam"
+
+
+class MailchimpWebhookEvent(BaseModel):
+    """Event from Mailchimp webhook."""
+    event_type: MailchimpEventType
+    email: str = Field(..., description="Recipient email")
+    campaign_id: str = Field(..., description="Mailchimp campaign ID")
+    timestamp: datetime = Field(default_factory=datetime.now)
+    url_clicked: Optional[str] = Field(None, description="URL if click event")
+    user_agent: Optional[str] = Field(None)
+    ip_address: Optional[str] = Field(None)
+
+
+class FollowupTask(BaseModel):
+    """Follow-up task in queue."""
+    id: Optional[str] = Field(None)
+    target_id: str = Field(..., description="Campaign target record ID")
+    campaign_id: str = Field(...)
+    email: str = Field(...)
+    followup_number: int = Field(1, ge=1, le=5)
+    scheduled_for: datetime
+    template: str = Field("followup_1")
+    created_at: datetime = Field(default_factory=datetime.now)
+    executed: bool = Field(False)
+    executed_at: Optional[datetime] = Field(None)
+
+
+class AlertNotification(BaseModel):
+    """Alert notification to send."""
+    type: str = Field(..., description="Alert type: hot_lead, response, error")
+    priority: str = Field("medium", description="low, medium, high, urgent")
+    title: str = Field(...)
+    message: str = Field(...)
+    channels: list[str] = Field(
+        default_factory=lambda: ["slack"],
+        description="Channels: slack, email, sms"
+    )
+    target_id: Optional[str] = Field(None)
+    campaign_id: Optional[str] = Field(None)
+    contact_email: Optional[str] = Field(None)
+    created_at: datetime = Field(default_factory=datetime.now)
+

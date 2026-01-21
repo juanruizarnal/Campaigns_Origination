@@ -1,78 +1,114 @@
-# Motor de Automatización de Originación Alter-5
+# Motor de Automatización de Originación Alter-5 v2.0
 
-Sistema de IA para automatizar el proceso de originación de empresas para intermediación financiera B2B.
+Sistema de IA autónomo 24/7 para automatizar el proceso completo de originación de empresas para intermediación financiera B2B.
 
 ## 🎯 Objetivo
 
-Automatizar el proceso de originación mediante 6 agentes especializados que:
-1. **Buscan** empresas que potencialmente necesitan financiación
-2. **Enriquecen** datos con información financiera y contactos
-3. **Evalúan** elegibilidad FEI (Fondo Europeo de Inversiones)
-4. **Analizan** triggers de mercado para campañas
-5. **Seleccionan** los mejores targets por campaña
-6. **Redactan** emails hiper-personalizados
+Automatizar **completamente** el proceso de originación mediante **8 agentes especializados** que operan en 3 modos:
+
+### Modos de Operación
+
+| Modo | Descripción | Agentes |
+|------|-------------|---------|
+| **Manual** | Interfaces Airtable + Claude Desktop + MCP | FEI básico |
+| **Semiautomático** | App Streamlit con supervisión humana | 1-6 |
+| **Automático 24/7** | Sistema autónomo con alertas | 1-8 |
+
+### Agentes del Sistema
+
+1. **Buscador** - Encuentra empresas vía Gemini + scraping
+2. **Enriquecedor** - Obtiene datos financieros y LinkedIn
+3. **Evaluador FEI** - Determina elegibilidad FEI (≥90% precisión)
+4. **Analizador** - Procesa triggers de mercado
+5. **Selector** - Elige targets óptimos (ML scoring)
+6. **Redactor** - Genera emails hiper-personalizados
+7. **Trigger Detector** 🆕 - Monitorea RSS/News 24/7
+8. **Follow-up Manager** 🆕 - Gestiona hot leads y seguimientos
 
 ## 🏗️ Arquitectura
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    MOTOR DE ORIGINACIÓN ALTER-5                          │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│   ORIGINACIÓN          CUALIFICACIÓN           CAMPAÑAS                 │
-│   ┌──────────┐      ┌──────────┐  ┌──────────┐  ┌──────────┐           │
-│   │ BUSCADOR │      │ENRIQUECE.│  │EVALUADOR │  │ANALIZADOR│           │
-│   │ EMPRESAS │      │  DATOS   │  │   FEI    │  │ CONTEXTO │           │
-│   └──────────┘      └──────────┘  └──────────┘  └──────────┘           │
-│                                                  ┌──────────┐           │
-│                                                  │ SELECTOR │           │
-│                                                  │ TARGETS  │           │
-│                                                  └──────────┘           │
-│                                                  ┌──────────┐           │
-│                                                  │ REDACTOR │           │
-│                                                  │ MENSAJES │           │
-│                                                  └──────────┘           │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    MOTOR DE ORIGINACIÓN ALTER-5 v2.0                            │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│   ┌──────────────────────────────────────────────────────────────────────────┐  │
+│   │                           FRONTEND (Streamlit)                            │  │
+│   │   📊 Dashboard | 🏢 Empresas | 🚀 Campañas | 🏷️ FEI | 📰 Triggers | 📧 Follow│  │
+│   └──────────────────────────────────────────────────────────────────────────┘  │
+│                                       │                                          │
+│   ┌──────────────────────────────────────────────────────────────────────────┐  │
+│   │                             8 AGENTES IA                                  │  │
+│   │  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐ │  │
+│   │  │BUSCADOR │ │ENRIQUEC.│ │   FEI   │ │ANALIZAD.│ │SELECTOR │ │REDACTOR │ │  │
+│   │  └─────────┘ └─────────┘ └─────────┘ └─────────┘ └─────────┘ └─────────┘ │  │
+│   │  ┌─────────┐ ┌─────────┐                                                 │  │
+│   │  │TRIGGER  │ │FOLLOWUP │  🆕 Nuevos agentes para modo 24/7               │  │
+│   │  │DETECTOR │ │MANAGER  │                                                 │  │
+│   │  └─────────┘ └─────────┘                                                 │  │
+│   └──────────────────────────────────────────────────────────────────────────┘  │
+│                                       │                                          │
+│   ┌──────────────────────────────────────────────────────────────────────────┐  │
+│   │                          ORQUESTACIÓN 24/7                                │  │
+│   │   Celery Worker + Beat | Redis Queue | FastAPI Webhooks | Slack Alerts   │  │
+│   └──────────────────────────────────────────────────────────────────────────┘  │
+│                                       │                                          │
+│   ┌──────────────────────────────────────────────────────────────────────────┐  │
+│   │                           INTEGRACIONES                                   │  │
+│   │   Airtable │ Gemini │ Claude │ Proxycurl │ Playwright │ Mailchimp       │  │
+│   └──────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## 📋 Requisitos
 
 - Python 3.11+
-- Cuentas API: Anthropic (Claude), Google AI (Gemini), Airtable
+- Docker & Docker Compose (para modo 24/7)
+- Cuentas API: Anthropic (Claude), Google AI (Gemini), Airtable, Proxycurl (opcional)
 
 ## 🚀 Instalación
 
-### 1. Clonar y crear entorno virtual
+### Opción A: Desarrollo Local
 
 ```bash
+# 1. Clonar repositorio
 git clone <repo-url>
-cd alter5-origination
+cd Origination_Campaigns_V2
+
+# 2. Crear entorno virtual
 python -m venv venv
-source venv/bin/activate  # Mac/Linux
-# venv\Scripts\activate   # Windows
-```
+source venv/bin/activate
 
-### 2. Instalar dependencias
+# 3. Instalar dependencias
+pip install -e .
 
-```bash
-pip install -r requirements.txt
+# 4. Instalar browsers de Playwright
+playwright install chromium
 
-# Para desarrollo:
-pip install -r requirements-dev.txt
-```
-
-### 3. Configurar variables de entorno
-
-```bash
-cp env.example.txt .env
+# 5. Configurar variables de entorno
+cp .env.example .env
 # Editar .env con tus API keys
+
+# 6. Ejecutar Streamlit
+streamlit run frontend/app.py
 ```
 
-### 4. Verificar APIs
+### Opción B: Docker (Recomendado para 24/7)
 
 ```bash
-python test_apis/run_all_tests.py
+# 1. Configurar variables de entorno
+cp .env.example .env
+# Editar .env con tus API keys
+
+# 2. Levantar servicios
+docker-compose up -d
+
+# Servicios disponibles:
+# - Streamlit: http://localhost:8501
+# - FastAPI: http://localhost:8000
+# - Redis: localhost:6379
+# - MongoDB: localhost:27017
 ```
 
 ## 🔧 Configuración
@@ -80,152 +116,122 @@ python test_apis/run_all_tests.py
 Variables de entorno requeridas en `.env`:
 
 ```bash
-# APIs
-ANTHROPIC_API_KEY=sk-ant-api03-...
-GOOGLE_API_KEY=AIzaSy...
-AIRTABLE_PAT=pat...
+# APIs Principales
+ANTHROPIC_API_KEY=sk-ant-api03-...    # Claude
+GOOGLE_API_KEY=AIzaSy...               # Gemini
+AIRTABLE_PAT=pat...                    # Airtable
 AIRTABLE_BASE_ID=appEgNSP0tOLJ9YJ9
 
-# Configuración
-DEFAULT_LANGUAGE=es
-COOLING_OFF_DAYS=90
-MAX_TARGETS_PER_CAMPAIGN=30
-MAX_EMAIL_WORDS=150
-MIN_FIT_SCORE=0.6
+# APIs Opcionales (para modo avanzado)
+PROXYCURL_API_KEY=...                  # LinkedIn data
+SLACK_BOT_TOKEN=xoxb-...               # Alertas
+MAILCHIMP_API_KEY=...                  # Email marketing
+
+# Infraestructura (modo 24/7)
+REDIS_URI=redis://localhost:6379/0
+MONGO_URI=mongodb://localhost:27017/alter5
 ```
 
 ## 📁 Estructura del Proyecto
 
 ```
-alter5-origination/
-├── config/                 # Configuración y prompts
-│   ├── settings.py         # Pydantic Settings
-│   ├── airtable_schema.py  # IDs de tablas y campos
-│   └── prompts/            # System prompts de agentes
-├── core/                   # Modelos y cliente Airtable
-│   ├── models.py           # Pydantic models
-│   └── airtable_client.py  # Wrapper con retry
-├── agents/                 # 6 agentes especializados
-│   ├── buscador.py         # Agente 1: BuscadorEmpresas
-│   ├── enriquecedor.py     # Agente 2: EnriquecedorDatos
-│   ├── evaluador_fei.py    # Agente 3: EvaluadorFEI
-│   ├── analizador.py       # Agente 4: AnalizadorContexto
-│   ├── selector.py         # Agente 5: SelectorTargets
-│   └── redactor.py         # Agente 6: RedactorMensajes
-├── integrations/           # Clientes de APIs externas
-│   ├── gemini.py           # Cliente Gemini
-│   ├── claude.py           # Cliente Claude
-│   └── mailchimp.py        # Cliente Mailchimp
-├── cli/                    # CLI con Typer
-└── tests/                  # Tests unitarios y de integración
+Origination_Campaigns_V2/
+├── config/                     # Configuración
+│   ├── settings.py             # Pydantic Settings
+│   ├── airtable_schema.py      # Schema Airtable
+│   └── prompts/                # System prompts
+├── core/                       # Core components
+│   ├── models.py               # Pydantic models (50+ modelos)
+│   ├── airtable_client.py      # Cliente Airtable
+│   └── campaign_orchestrator.py
+├── agents/                     # 8 Agentes IA
+│   ├── buscador.py             # Agente 1: BuscadorEmpresas
+│   ├── enriquecedor.py         # Agente 2: EnriquecedorDatos
+│   ├── evaluador_fei.py        # Agente 3: EvaluadorFEI
+│   ├── analizador.py           # Agente 4: AnalizadorContexto
+│   ├── selector.py             # Agente 5: SelectorTargets
+│   ├── redactor.py             # Agente 6: RedactorMensajes
+│   ├── trigger_detector.py     # Agente 7: TriggerDetector 🆕
+│   └── followup_manager.py     # Agente 8: FollowupManager 🆕
+├── integrations/               # Clientes APIs
+│   ├── gemini.py               # Cliente Gemini
+│   ├── claude.py               # Cliente Claude
+│   ├── mailchimp.py            # Cliente Mailchimp
+│   ├── proxycurl.py            # LinkedIn API 🆕
+│   ├── scraper.py              # Playwright scraper 🆕
+│   └── slack.py                # Slack alerts 🆕
+├── orchestration/              # Modo 24/7 🆕
+│   └── tasks.py                # Celery tasks
+├── api/                        # API REST 🆕
+│   └── webhooks.py             # FastAPI webhooks
+├── frontend/                   # Streamlit App
+│   ├── app.py                  # Entry point
+│   └── pages/                  # 8 páginas
+├── docker-compose.yml          # Docker config 🆕
+├── Dockerfile                  # Container 🆕
+└── pyproject.toml              # Dependencies
 ```
 
 ## 💻 Uso
 
-### CLI Completo
+### Modo Semiautomático (Streamlit)
 
 ```bash
-# ============================================================
-# BÚSQUEDA DE EMPRESAS (Agente 1: BuscadorEmpresas)
-# ============================================================
+streamlit run frontend/app.py
+```
 
-# Buscar empresas nuevas en un sector y país
-python -m cli.main search companies --sector "renovables" --country ES --region "Andalucía" --limit 25
+Navega a http://localhost:8501 para acceder a:
+- 📊 Dashboard - KPIs y métricas
+- 🔄 Originación - Pipeline búsqueda → enriquecimiento → FEI
+- 🚀 Nueva Campaña - Crear campañas desde triggers
+- 📰 Triggers - Monitorear eventos de mercado
+- 📧 Follow-up - Gestionar hot leads
 
-# Buscar con keywords adicionales
-python -m cli.main search companies --sector "energía" --keywords "solar,fotovoltaica" --min-employees 50
+### Modo 24/7 Automático (Docker)
 
-# ============================================================
-# ENRIQUECIMIENTO DE DATOS (Agente 2: EnriquecedorDatos)
-# ============================================================
+```bash
+# Iniciar todos los servicios
+docker-compose up -d
 
-# Enriquecer una empresa específica
-python -m cli.main company enrich recXXXXXXXXXXXXXXX --verbose
+# Ver logs
+docker-compose logs -f celery-worker
 
-# Enriquecer batch de empresas
-python -m cli.main company enrich-batch --fei-status Unknown --limit 100
+# Ver estado de tareas
+docker-compose exec app celery -A orchestration.tasks inspect active
+```
 
-# ============================================================
-# EVALUACIÓN FEI (Agente 3: EvaluadorFEI)
-# ============================================================
+Tareas programadas automáticamente:
+- **Cada hora**: Escaneo de triggers (RSS feeds)
+- **Cada 30 min**: Ejecución de follow-ups pendientes
+- **Cada 2 horas**: Creación automática de campañas desde triggers
+- **8:00 AM**: Resumen diario en Slack
 
-# Evaluar FEI de una empresa
-python -m cli.main fei evaluate recXXXXXXXXXXXXXXX --verbose
+### CLI (Para testing)
 
-# Evaluación batch
-python -m cli.main fei batch --status Unknown --limit 200
+```bash
+# Buscar empresas
+python -m cli.main search companies --sector "renovables" --country ES --limit 10
 
-# ============================================================
-# ANÁLISIS DE CONTEXTO (Agente 4: AnalizadorContexto)
-# ============================================================
+# Evaluar FEI
+python -m cli.main fei evaluate recXXXXXXX
 
-# Analizar un trigger de mercado
-python -m cli.main context analyze "BCE baja tipos de interés 0.25%" --sectors Industrials,Renewables
-
-# ============================================================
-# SELECCIÓN DE TARGETS (Agente 5: SelectorTargets)
-# ============================================================
-
-# Seleccionar targets para una campaña
-python -m cli.main campaign select recCampaignXXX --sectors Industrials --countries ES,PT --max 30
-
-# ============================================================
-# GENERACIÓN DE MENSAJES (Agente 6: RedactorMensajes)
-# ============================================================
-
-# Generar mensaje para un target
-python -m cli.main message generate recTargetXXX --tone professional
-
-# Generación batch para campaña
-python -m cli.main message batch recCampaignXXX --tone friendly
-
-# ============================================================
-# PIPELINE COMPLETO DE ORIGINACIÓN
-# ============================================================
-
-# Buscar + Enriquecer + Evaluar FEI en un solo comando
-python -m cli.main originate --sector "renovables" --country ES --limit 25 --enrich --fei
-
-# Solo búsqueda (sin enriquecer ni evaluar)
-python -m cli.main originate --sector "tecnología" --country ES --no-enrich --no-fei
-
-# ============================================================
-# CREACIÓN DE CAMPAÑAS
-# ============================================================
-
-# Crear campaña completa desde un trigger
-python -m cli.main campaign create "BCE baja tipos 0.25%" \
-    --sectors Industrials,Renewables \
-    --countries ES,PT \
-    --max 20 \
-    --auto-approve
-
-# ============================================================
-# SISTEMA Y MÉTRICAS
-# ============================================================
-
-# Ver estado y KPIs del sistema
-python -m cli.main status
-
-# Ver métricas de una campaña específica
-python -m cli.main status --campaign-id recXXXXXXXXXXXXXXX --verbose
-
-# Ver versión
-python -m cli.main version
+# Pipeline completo
+python -m cli.main originate --sector "tecnología" --country ES --enrich --fei
 ```
 
 ## 📊 Métricas de Éxito
 
-| Métrica | Baseline | Target MVP |
-|---------|----------|------------|
-| Tiempo crear campaña | 4-8h | ≤45 min |
+| Métrica | Baseline | Target v2.0 |
+|---------|----------|-------------|
+| Tiempo crear campaña | 4-8h | ≤15 min |
 | Precisión FEI | ~50% | ≥90% |
-| Tasa de respuesta | 2-3% | ≥8% |
-| Reuniones/mes | 2-3 | ≥8 |
+| Empresas/día (auto) | 0 | 500+ |
+| Hot leads/semana | 2-3 | ≥15 |
+| Reuniones/mes | 2-3 | ≥12 |
 
 ## 🔑 Criterios FEI
 
-Una empresa es elegible para garantía FEI si cumple AL MENOS UNO de estos criterios:
+Elegibilidad FEI (AL MENOS UN criterio):
 
 | Código | Criterio |
 |--------|----------|
@@ -233,17 +239,33 @@ Una empresa es elegible para garantía FEI si cumple AL MENOS UNO de estos crite
 | 1.2 | Patente Clean Energy (últimos 3 años) |
 | 1.3 | Eco-Label EU/Nacional/Internacional |
 | 1.4 | Green Business ≥90% revenue |
-| 1.5 | Green Business Model con impacto verificable |
-| 1.6 | Certificado Ambiental válido |
+| 1.5 | Green Business Model con impacto |
+| 1.6 | Certificado Ambiental válido (ISO 14001, etc.) |
 
 ## 📚 Documentación
 
-- [PRD Completo](C.Deliverables/PRD_MVP_Originacion_Alter.md)
-- [Tareas de Desarrollo](C.Deliverables/MVP_Origination_Alter_Development_Tasks.md)
-- [Contexto Maestro](B.Project_Context/B.1.ContextoGeneral/Main_Promt_Origination.md)
-- [Esquema BBDD](B.Project_Context/B.1.ContextoGeneral/Origination_Campaigns_Full_Database_COMPLETE.md)
+- [PRD Motor Autónomo](C.Deliverables/PRD_Motor_Originacion_Autonomo_24-7.md)
+- [Plan de Desarrollo](C.Deliverables/TASK_motor_originacion.md)
+- [Evaluación Código](C.Deliverables/04-Evaluacion-Adaptacion-Sistema-Autonomo.md)
+- [Arquitectura Sistema](C.Deliverables/02-Arquitectura-Sistema-Autonomo.md)
+
+## 🔄 Changelog v2.0
+
+### Nuevos Agentes
+- ✅ **Trigger Detector** (Agente 7) - Monitoreo 24/7 de RSS/News
+- ✅ **Follow-up Manager** (Agente 8) - Gestión automática de hot leads
+
+### Nuevas Integraciones
+- ✅ **Playwright Scraper** - Deep scraping de websites
+- ✅ **Proxycurl** - Datos de LinkedIn
+- ✅ **Slack** - Sistema de alertas
+- ✅ **FastAPI Webhooks** - Recepción eventos Mailchimp
+
+### Nueva Infraestructura
+- ✅ **Celery + Redis** - Task queue para 24/7
+- ✅ **Docker Compose** - Entorno completo containerizado
+- ✅ **Streamlit v2** - 8 páginas con nuevas funcionalidades
 
 ## 📝 Licencia
 
 Propietario - Alter-5 © 2026
-

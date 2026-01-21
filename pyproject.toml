@@ -1,41 +1,102 @@
 [project]
 name = "alter5-origination"
-version = "0.1.0"
-description = "Motor de Automatización de Originación Alter-5"
+version = "2.0.0"
+description = "Motor de Automatización de Originación Alter-5 - Sistema Autónomo 24/7"
 authors = [
     {name = "Alter-5", email = "tech@alter-5.com"}
 ]
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "Proprietary"}
-keywords = ["ai", "llm", "origination", "fintech", "b2b"]
+keywords = ["ai", "llm", "origination", "fintech", "b2b", "automation", "fei"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
 ]
 
 dependencies = [
-    "pyairtable>=2.0.0",
-    "anthropic>=0.18.0",
-    "google-generativeai>=0.4.0",
-    "pydantic>=2.0.0",
-    "pydantic-settings>=2.0.0",
-    "httpx>=0.26.0",
-    "tenacity>=8.0.0",
-    "typer>=0.9.0",
-    "structlog>=24.0.0",
-    "python-dotenv>=1.0.0",
+    # Core - LLM APIs (synchronized with requirements.txt)
+    "anthropic>=0.40.0",           # Claude API - versión estable con Messages API
+    "google-generativeai>=0.8.3",  # Gemini API - incluye Search Grounding
+    "openai>=1.10.0",              # OpenAI API - para embeddings
+
+    # Core - Base de Datos y Validación
+    "pyairtable>=2.3.3",           # Cliente Airtable oficial
+    "pydantic>=2.10.3",            # Validación de datos y modelos
+    "pydantic-settings>=2.6.1",    # Gestión de configuración desde .env
+    "pymongo>=4.6.0",              # MongoDB client para cache
+
+    # Core - HTTP y Resilencia
+    "httpx>=0.28.1",               # Cliente HTTP async moderno
+    "tenacity>=9.0.0",             # Retry logic para APIs
+    "aiohttp>=3.11.11",            # Async HTTP (dependencia de google-generativeai)
+
+    # Frontend - Streamlit
+    "streamlit>=1.30.0",           # Dashboard UI framework
+
+    # Web Scraping
+    "playwright>=1.40.0",          # Browser automation para scraping
+    "trafilatura>=1.6.0",          # Content extraction
+
+    # Task Queue & Scheduling
+    "celery>=5.3.0",               # Distributed task queue
+    "redis>=5.0.0",                # Redis client para Celery broker
+    "apscheduler>=3.10.4",         # Scheduler para tareas programadas
+
+    # API Server
+    "fastapi>=0.109.0",            # API framework
+    "uvicorn>=0.27.0",             # ASGI server
+
+    # Notifications
+    "slack-sdk>=3.26.0",           # Slack client para alertas
+
+    # Data Processing
+    "feedparser>=6.0.0",           # RSS feed parsing
+    "pandas>=2.0.0",               # Data manipulation (usado por Streamlit)
+
+    # CLI y Logging
+    "typer>=0.9.0",                # CLI framework moderno
+    "click>=8.1.7",                # Command line toolkit (pinned for typer compatibility)
+    "rich>=13.9.4",                # Output enriquecido para CLI
+    "structlog>=24.4.0",           # Logging estructurado
+
+    # Utilidades
+    "python-dotenv>=1.0.1",        # Carga de variables de entorno
+    "python-dateutil>=2.9.0",      # Manipulación de fechas
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=7.0.0",
-    "pytest-cov>=4.0.0",
-    "pytest-asyncio>=0.21.0",
-    "ruff>=0.1.0",
-    "mypy>=1.0.0",
+    "pytest>=8.0.0",
+    "pytest-cov>=4.1.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-playwright>=0.4.4",
+    "ruff>=0.2.0",
+    "mypy>=1.8.0",
+    "types-redis>=4.6.0",
+    "httpx>=0.28.1",  # For testing FastAPI
+]
+
+frontend = [
+    "streamlit>=1.30.0",
+    "plotly>=5.18.0",
+]
+
+ml = [
+    "xgboost>=2.0.0",
+    "scikit-learn>=1.4.0",
+    "openai>=1.10.0",
+    "pinecone-client>=3.0.0",
+]
+
+automation = [
+    "celery>=5.3.0",
+    "redis>=5.0.0",
+    "apscheduler>=3.10.4",
+    "fastapi>=0.109.0",
+    "uvicorn>=0.27.0",
 ]
 
 [project.scripts]
@@ -46,7 +107,7 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["config*", "core*", "agents*", "integrations*", "cli*"]
+include = ["config*", "core*", "agents*", "integrations*", "cli*", "orchestration*", "api*", "ml*", "frontend*"]
 
 [tool.ruff]
 line-length = 100
@@ -66,7 +127,7 @@ ignore = [
 ]
 
 [tool.ruff.isort]
-known-first-party = ["config", "core", "agents", "integrations", "cli"]
+known-first-party = ["config", "core", "agents", "integrations", "cli", "orchestration", "api", "ml", "frontend"]
 
 [tool.mypy]
 python_version = "3.11"
@@ -83,8 +144,8 @@ asyncio_mode = "auto"
 addopts = "-v --cov=. --cov-report=term-missing"
 
 [tool.coverage.run]
-source = ["config", "core", "agents", "integrations", "cli"]
-omit = ["*/tests/*", "*/__init__.py"]
+source = ["config", "core", "agents", "integrations", "cli", "orchestration", "api", "ml"]
+omit = ["*/tests/*", "*/__init__.py", "frontend/*"]
 
 [tool.coverage.report]
 exclude_lines = [

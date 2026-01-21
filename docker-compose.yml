@@ -1,0 +1,208 @@
+# =============================================================================
+# Motor de Originación Alter-5 - Docker Compose
+# =============================================================================
+# Uso:
+#   Desarrollo:     docker-compose up -d
+#   Ver logs:       docker-compose logs -f
+#   Parar:          docker-compose down
+#   Con build:      docker-compose up -d --build
+# =============================================================================
+
+version: '3.8'
+
+services:
+  # ---------------------------------------------------------------------------
+  # Aplicación Principal (Streamlit)
+  # ---------------------------------------------------------------------------
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: alter5-app
+    ports:
+      - "8501:8501"  # Streamlit
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - AIRTABLE_PAT=${AIRTABLE_PAT}
+      - AIRTABLE_BASE_ID=${AIRTABLE_BASE_ID}
+      - PROXYCURL_API_KEY=${PROXYCURL_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN:-}
+      - REDIS_URL=redis://redis:6379/0
+      - MONGODB_URL=mongodb://mongodb:27017/alter5
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - .:/app
+      - /app/.venv  # Excluir venv del volumen
+    depends_on:
+      - redis
+      - mongodb
+    command: streamlit run frontend/app.py --server.port 8501 --server.address 0.0.0.0
+    restart: unless-stopped
+    networks:
+      - alter5-network
+
+  # ---------------------------------------------------------------------------
+  # API (FastAPI) - Solo para webhooks y automatización
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: alter5-api
+    ports:
+      - "8000:8000"
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - AIRTABLE_PAT=${AIRTABLE_PAT}
+      - AIRTABLE_BASE_ID=${AIRTABLE_BASE_ID}
+      - MAILCHIMP_API_KEY=${MAILCHIMP_API_KEY:-}
+      - MAILCHIMP_WEBHOOK_SECRET=${MAILCHIMP_WEBHOOK_SECRET:-}
+      - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN:-}
+      - REDIS_URL=redis://redis:6379/0
+      - MONGODB_URL=mongodb://mongodb:27017/alter5
+    volumes:
+      - .:/app
+    depends_on:
+      - redis
+      - mongodb
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+    restart: unless-stopped
+    networks:
+      - alter5-network
+    profiles:
+      - automation  # Solo se inicia con: docker-compose --profile automation up
+
+  # ---------------------------------------------------------------------------
+  # Redis - Cola de tareas y caché
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: alter5-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+    networks:
+      - alter5-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # MongoDB - Cache y sincronización con Airtable
+  # ---------------------------------------------------------------------------
+  mongodb:
+    image: mongo:7
+    container_name: alter5-mongodb
+    ports:
+      - "27017:27017"
+    environment:
+      - MONGO_INITDB_DATABASE=alter5
+    volumes:
+      - mongodb-data:/data/db
+    restart: unless-stopped
+    networks:
+      - alter5-network
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Celery Worker - Procesamiento de tareas asíncronas
+  # ---------------------------------------------------------------------------
+  celery-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: alter5-celery-worker
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - AIRTABLE_PAT=${AIRTABLE_PAT}
+      - AIRTABLE_BASE_ID=${AIRTABLE_BASE_ID}
+      - PROXYCURL_API_KEY=${PROXYCURL_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN:-}
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - MONGODB_URL=mongodb://mongodb:27017/alter5
+    volumes:
+      - .:/app
+    depends_on:
+      redis:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+    command: celery -A orchestration.tasks worker -l info -c 2
+    restart: unless-stopped
+    networks:
+      - alter5-network
+    profiles:
+      - automation
+
+  # ---------------------------------------------------------------------------
+  # Celery Beat - Scheduler para tareas periódicas
+  # ---------------------------------------------------------------------------
+  celery-beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: alter5-celery-beat
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    volumes:
+      - .:/app
+    depends_on:
+      - redis
+      - celery-worker
+    command: celery -A orchestration.tasks beat -l info
+    restart: unless-stopped
+    networks:
+      - alter5-network
+    profiles:
+      - automation
+
+  # ---------------------------------------------------------------------------
+  # Flower - Monitoreo de Celery (opcional, desarrollo)
+  # ---------------------------------------------------------------------------
+  flower:
+    image: mher/flower:2.0
+    container_name: alter5-flower
+    ports:
+      - "5555:5555"
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+    depends_on:
+      - redis
+      - celery-worker
+    restart: unless-stopped
+    networks:
+      - alter5-network
+    profiles:
+      - monitoring
+
+# =============================================================================
+# Volúmenes persistentes
+# =============================================================================
+volumes:
+  redis-data:
+    driver: local
+  mongodb-data:
+    driver: local
+
+# =============================================================================
+# Red
+# =============================================================================
+networks:
+  alter5-network:
+    driver: bridge

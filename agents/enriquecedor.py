@@ -1,11 +1,14 @@
 """Agente Enriquecedor de Datos for Alter-5 Origination Engine.
 
 This module implements the EnriquecedorDatos agent (Agent 2) which enriches
-company data by searching the web for missing information using Gemini's
-search grounding capabilities.
+company data by searching the web for missing information using:
+- Playwright web scraping for company websites
+- Proxycurl for LinkedIn data
+- Gemini search grounding for additional information
 
 The agent can:
 - Complete basic company data (employees, description, LinkedIn)
+- Extract certifications for FEI eligibility (ISO 14001, B Corp, etc.)
 - Extract financial information (revenue, EBITDA, debt)
 - Identify key persons (CEO, CFO, executives)
 - Create contacts and financial records in Airtable
@@ -17,6 +20,7 @@ Usage:
     result = agent.enrich_company("recXXXXXX")
 """
 
+import asyncio
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, Optional
@@ -32,8 +36,18 @@ from config.airtable_schema import (
 )
 from config.prompts import load_prompt
 from core.airtable_client import AirtableClient, AirtableError, get_airtable_client
-from core.models import Company, Contact, KeyPerson
+from core.async_utils import run_async
+from core.models import (
+    Company,
+    Contact,
+    KeyPerson,
+    ScrapedCompanyData,
+    LinkedInCompanyData,
+    LinkedInPersonData,
+)
 from integrations.gemini import GeminiClient, GeminiError, get_gemini_client
+from integrations.scraper import PlaywrightScraper, scrape_company, has_fei_certificate
+from integrations.proxycurl import ProxycurlClient, find_company_linkedin
 
 logger = structlog.get_logger()
 
@@ -52,6 +66,16 @@ class CompanyInfo:
     sector: Optional[str] = None
     founded_year: Optional[int] = None
     
+    # NEW: Data from scraping
+    activities: list[str] = field(default_factory=list)
+    certifications: list[str] = field(default_factory=list)
+    green_indicators: list[str] = field(default_factory=list)
+    
+    # NEW: LinkedIn data
+    linkedin_description: Optional[str] = None
+    linkedin_specialties: list[str] = field(default_factory=list)
+    linkedin_posts: list[str] = field(default_factory=list)
+    
     def has_data(self) -> bool:
         """Check if any data was extracted."""
         return any([
@@ -60,7 +84,12 @@ class CompanyInfo:
             self.description,
             self.hq_address,
             self.sector,
+            self.certifications,
         ])
+    
+    def has_fei_relevant_data(self) -> bool:
+        """Check if we have data relevant for FEI evaluation."""
+        return bool(self.certifications or self.green_indicators)
 
 
 @dataclass
@@ -103,13 +132,24 @@ class EnrichmentResult:
     errors: list[str] = field(default_factory=list)
     processing_time_seconds: float = 0.0
     
+    # NEW: Source tracking
+    scraped_data: Optional[ScrapedCompanyData] = None
+    linkedin_data: Optional[LinkedInCompanyData] = None
+    data_sources: list[str] = field(default_factory=list)
+    
+    # NEW: FEI relevant
+    certifications_found: list[str] = field(default_factory=list)
+    has_fei_certificate: bool = False
+    
     def __str__(self) -> str:
         status = "✅" if self.success else "❌"
+        fei_status = "🟢 FEI" if self.has_fei_certificate else ""
         return (
             f"{status} Enrichment for {self.company_id}: "
             f"info={'yes' if self.company_info and self.company_info.has_data() else 'no'}, "
             f"financials={'yes' if self.financial_info and self.financial_info.has_data() else 'no'}, "
-            f"contacts={self.contacts_created}"
+            f"contacts={self.contacts_created}, "
+            f"certs={len(self.certifications_found)} {fei_status}"
         )
 
 
@@ -118,12 +158,16 @@ class EnrichmentResult:
 # ==============================================================================
 
 class EnriquecedorDatos:
-    """Agent for enriching company data from web sources.
+    """Agent for enriching company data from multiple sources.
     
-    Uses Gemini's search grounding capabilities to find and extract:
-    - Basic company information (employees, description, address)
-    - Financial data (revenue, EBITDA, debt)
-    - Key personnel (executives, decision makers)
+    Uses multiple data sources for comprehensive enrichment:
+    - Playwright scraping for company websites (certifications, contacts)
+    - Proxycurl for LinkedIn data (employees, posts, executives)
+    - Gemini search grounding for additional information
+    
+    Critical for FEI evaluation:
+    - Extracts certifications (ISO 14001, B Corp, EMAS, etc.)
+    - Identifies green/sustainability indicators
     
     Example:
         agent = EnriquecedorDatos()
@@ -132,39 +176,97 @@ class EnriquecedorDatos:
         if result.success:
             print(f"Enriched {result.company_id}")
             print(f"- Employees: {result.company_info.num_employees}")
-            print(f"- Contacts created: {result.contacts_created}")
+            print(f"- Certifications: {result.certifications_found}")
+            print(f"- FEI eligible: {result.has_fei_certificate}")
     """
     
     def __init__(
         self,
         airtable_client: Optional[AirtableClient] = None,
         gemini_client: Optional[GeminiClient] = None,
+        use_scraping: bool = True,
+        use_linkedin: bool = True,
     ):
         """Initialize the EnriquecedorDatos agent.
         
         Args:
             airtable_client: Optional custom Airtable client
             gemini_client: Optional custom Gemini client
+            use_scraping: Whether to use Playwright scraping
+            use_linkedin: Whether to use Proxycurl for LinkedIn
         """
         self._airtable = airtable_client or get_airtable_client()
         self._gemini = gemini_client or get_gemini_client()
         self._system_prompt = load_prompt("enriquecedor")
+        self._use_scraping = use_scraping
+        self._use_linkedin = use_linkedin
         
-        logger.info("enriquecedor_datos_initialized")
+        logger.info(
+            "enriquecedor_datos_initialized",
+            use_scraping=use_scraping,
+            use_linkedin=use_linkedin,
+        )
     
     def enrich_company(
         self,
         company_id: str,
         include_financials: bool = True,
         include_contacts: bool = True,
+        include_scraping: bool = True,
+        include_linkedin: bool = True,
         dry_run: bool = False,
     ) -> EnrichmentResult:
-        """Enrich a company with additional data from web sources.
+        """Enrich a company with additional data from multiple sources.
+        
+        This is a sync wrapper that safely runs the async implementation.
+        """
+        return run_async(
+            self._enrich_company_async(
+                company_id=company_id,
+                include_financials=include_financials,
+                include_contacts=include_contacts,
+                include_scraping=include_scraping,
+                include_linkedin=include_linkedin,
+                dry_run=dry_run,
+            )
+        )
+
+    def enrich(
+        self,
+        company_id: str,
+        dry_run: bool = False,
+        include_financials: bool = True,
+        include_contacts: bool = True,
+        include_scraping: bool = True,
+        include_linkedin: bool = True,
+    ) -> EnrichmentResult:
+        """Backward-compatible alias for enrich_company."""
+        return self.enrich_company(
+            company_id=company_id,
+            include_financials=include_financials,
+            include_contacts=include_contacts,
+            include_scraping=include_scraping,
+            include_linkedin=include_linkedin,
+            dry_run=dry_run,
+        )
+
+    async def _enrich_company_async(
+        self,
+        company_id: str,
+        include_financials: bool = True,
+        include_contacts: bool = True,
+        include_scraping: bool = True,
+        include_linkedin: bool = True,
+        dry_run: bool = False,
+    ) -> EnrichmentResult:
+        """Enrich a company with additional data from multiple sources.
         
         Args:
             company_id: Airtable record ID of the company
             include_financials: Whether to search for financial data
             include_contacts: Whether to search for key persons
+            include_scraping: Whether to scrape the company website
+            include_linkedin: Whether to fetch LinkedIn data
             dry_run: If True, don't save changes to Airtable
             
         Returns:
@@ -179,6 +281,8 @@ class EnriquecedorDatos:
             company_id=company_id,
             include_financials=include_financials,
             include_contacts=include_contacts,
+            include_scraping=include_scraping,
+            include_linkedin=include_linkedin,
             dry_run=dry_run,
         )
         
@@ -189,6 +293,7 @@ class EnriquecedorDatos:
             company_record = self._airtable.get_record("companies", company_id)
             company_name = company_record.get("fields", {}).get("Company Name", "")
             company_url = company_record.get("fields", {}).get("Home URL", "")
+            existing_linkedin = company_record.get("fields", {}).get("Linkedin URL", "")
             
             if not company_name:
                 result.errors.append("Company name is empty")
@@ -201,21 +306,117 @@ class EnriquecedorDatos:
                 company_url=company_url,
             )
             
-            # 2. Search for company info
-            company_info = self._search_company_info(company_name, company_url)
+            # Initialize company_info
+            company_info = CompanyInfo()
+            
+            # 2. NEW: Scrape company website (critical for FEI)
+            if include_scraping and self._use_scraping and company_url:
+                try:
+                    scraped_data = await scrape_company(company_url)
+                    result.scraped_data = scraped_data
+                    result.data_sources.append("web_scraping")
+                    
+                    if scraped_data.success:
+                        # Extract FEI-relevant data
+                        company_info.certifications = scraped_data.certifications
+                        company_info.green_indicators = scraped_data.green_indicators
+                        company_info.activities = scraped_data.activities
+                        
+                        result.certifications_found = scraped_data.certifications
+                        result.has_fei_certificate = has_fei_certificate(scraped_data)
+                        
+                        # Use scraped data if not available elsewhere
+                        if scraped_data.employee_count:
+                            company_info.num_employees = scraped_data.employee_count
+                        if scraped_data.description:
+                            company_info.description = scraped_data.description
+                        if scraped_data.linkedin_url and not existing_linkedin:
+                            company_info.linkedin_url = scraped_data.linkedin_url
+                        
+                        logger.info(
+                            "scraping_complete",
+                            task_id=task_id,
+                            certifications=len(scraped_data.certifications),
+                            green_indicators=len(scraped_data.green_indicators),
+                            has_fei=result.has_fei_certificate,
+                        )
+                except Exception as e:
+                    logger.warning("scraping_failed", task_id=task_id, error=str(e))
+                    result.errors.append(f"Scraping failed: {e}")
+            
+            # 3. NEW: Fetch LinkedIn data
+            linkedin_url = existing_linkedin or company_info.linkedin_url
+            if include_linkedin and self._use_linkedin:
+                try:
+                    # Find LinkedIn URL if we don't have it
+                    if not linkedin_url:
+                        linkedin_url = await find_company_linkedin(company_name)
+                        if linkedin_url:
+                            company_info.linkedin_url = linkedin_url
+                    
+                    if linkedin_url:
+                        async with ProxycurlClient() as client:
+                            linkedin_data = await client.get_company_profile(linkedin_url)
+                            
+                        if linkedin_data:
+                            result.linkedin_data = linkedin_data
+                            result.data_sources.append("linkedin")
+                            
+                            # Merge LinkedIn data
+                            if linkedin_data.employee_count and not company_info.num_employees:
+                                company_info.num_employees = linkedin_data.employee_count
+                            if linkedin_data.description:
+                                company_info.linkedin_description = linkedin_data.description
+                                if not company_info.description:
+                                    company_info.description = linkedin_data.description
+                            if linkedin_data.industry and not company_info.sector:
+                                company_info.sector = linkedin_data.industry
+                            if linkedin_data.specialties:
+                                company_info.linkedin_specialties = linkedin_data.specialties
+                            if linkedin_data.recent_posts:
+                                company_info.linkedin_posts = linkedin_data.recent_posts
+                            
+                            logger.info(
+                                "linkedin_data_fetched",
+                                task_id=task_id,
+                                employees=linkedin_data.employee_count,
+                                has_posts=bool(linkedin_data.recent_posts),
+                            )
+                except Exception as e:
+                    logger.warning("linkedin_fetch_failed", task_id=task_id, error=str(e))
+                    result.errors.append(f"LinkedIn fetch failed: {e}")
+            
+            # 4. Use Gemini for additional info (fallback/complement)
+            gemini_info = self._search_company_info(company_name, company_url)
+            
+            # Merge Gemini data (only fill gaps)
+            if gemini_info.num_employees and not company_info.num_employees:
+                company_info.num_employees = gemini_info.num_employees
+            if gemini_info.description and not company_info.description:
+                company_info.description = gemini_info.description
+            if gemini_info.linkedin_url and not company_info.linkedin_url:
+                company_info.linkedin_url = gemini_info.linkedin_url
+            if gemini_info.hq_address and not company_info.hq_address:
+                company_info.hq_address = gemini_info.hq_address
+            if gemini_info.sector and not company_info.sector:
+                company_info.sector = gemini_info.sector
+            if gemini_info.founded_year:
+                company_info.founded_year = gemini_info.founded_year
+            
+            result.data_sources.append("gemini")
             result.company_info = company_info
             
-            # 3. Search for financial data
+            # 5. Search for financial data
             if include_financials:
                 financial_info = self._extract_financials(company_name, company_url)
                 result.financial_info = financial_info
             
-            # 4. Search for key persons
+            # 6. Search for key persons
             if include_contacts:
                 key_persons = self._identify_key_persons(company_name, company_url)
                 result.key_persons = key_persons
             
-            # 5. Save results to Airtable
+            # 7. Save results to Airtable
             if not dry_run:
                 self._save_results(
                     company_id=company_id,
@@ -268,6 +469,9 @@ class EnriquecedorDatos:
             has_financials=result.financial_info is not None and result.financial_info.has_data(),
             contacts_found=len(result.key_persons),
             contacts_created=result.contacts_created,
+            certifications_found=len(result.certifications_found),
+            has_fei_certificate=result.has_fei_certificate,
+            data_sources=result.data_sources,
             processing_time=result.processing_time_seconds,
         )
         
@@ -292,29 +496,36 @@ class EnriquecedorDatos:
             company_name=company_name,
         )
         
-        # Build search query
+        # Build search query - more specific for better results
         query = f"""
-Search for information about the company "{company_name}".
-{f'Their website is: {company_url}' if company_url else ''}
+Busca información VERIFICABLE sobre la empresa "{company_name}".
+{f'Su sitio web oficial es: {company_url}' if company_url else ''}
 
-Find and extract:
-1. Number of employees (approximate)
-2. LinkedIn company page URL
-3. Brief description of what the company does (2-3 sentences)
-4. Headquarters address (city, country)
-5. Industry/sector classification
+INSTRUCCIONES IMPORTANTES:
+1. Busca en fuentes OFICIALES: LinkedIn, página de la empresa, registros mercantiles, memorias anuales
+2. NO inventes datos. Si no encuentras información fiable, indica null
+3. Los empleados deben ser datos reales de LinkedIn o fuentes oficiales
+4. La descripción debe ser objetiva y basada en información de la empresa
 
-Return ONLY a JSON object with this exact structure:
+Información a buscar:
+1. Número de empleados (de LinkedIn o fuentes oficiales)
+2. URL del perfil de empresa en LinkedIn (formato: linkedin.com/company/xxx)
+3. Descripción breve de la actividad principal (2-3 oraciones)
+4. Dirección de la sede central (ciudad, país)
+5. Sector/industria principal (clasificación GICS o similar)
+6. Año de fundación
+
+Devuelve ÚNICAMENTE un objeto JSON con esta estructura exacta:
 {{
-    "num_employees": <number or null>,
-    "linkedin_url": "<url or null>",
-    "description": "<string or null>",
-    "hq_address": "<string or null>",
-    "sector": "<string or null>",
-    "founded_year": <number or null>
+    "num_employees": <número entero o null si no disponible>,
+    "linkedin_url": "<URL completa de LinkedIn o null>",
+    "description": "<descripción objetiva o null>",
+    "hq_address": "<ciudad, país o null>",
+    "sector": "<sector principal o null>",
+    "founded_year": <año como número o null>
 }}
 
-If you cannot find reliable information for a field, use null.
+CRÍTICO: Solo incluye datos que puedas verificar. Es mejor null que un dato inventado.
 """
         
         try:
@@ -367,33 +578,39 @@ If you cannot find reliable information for a field, use null.
         current_year = date.today().year
         
         query = f"""
-Search for financial information about "{company_name}".
-{f'Website: {company_url}' if company_url else ''}
+Busca información financiera OFICIAL y VERIFICABLE de la empresa "{company_name}".
+{f'Sitio web: {company_url}' if company_url else ''}
 
-Find the most recent financial data (from {current_year-3} to {current_year}):
-1. Annual revenues (in EUR or USD)
-2. EBITDA (in EUR or USD)
-3. Net financial debt (in EUR or USD)
-4. The year of these figures
+FUENTES PRIORITARIAS (buscar en este orden):
+1. Cuentas anuales depositadas en Registro Mercantil (España: SABI, Francia: Infogreffe, etc.)
+2. Memorias anuales o informes financieros publicados en la web de la empresa
+3. Base de datos empresariales (Dun & Bradstreet, Bureau van Dijk, etc.)
+4. Artículos de prensa económica con datos verificados
+5. LinkedIn (para tamaño de empresa)
 
-Look for:
-- Annual reports
-- Press releases about financial results
-- Company registries
-- Business databases
+DATOS A BUSCAR (años {current_year-3} a {current_year}):
+1. Ingresos/Facturación anual (en EUR o moneda local)
+2. EBITDA (si está disponible)
+3. Deuda financiera neta (si está disponible)
+4. Año de los datos
+5. Fuente de los datos (importante para verificabilidad)
 
-Return ONLY a JSON object with this exact structure:
+Devuelve ÚNICAMENTE un objeto JSON con esta estructura:
 {{
-    "annual_revenues": <number in EUR or null>,
-    "ebitda": <number in EUR or null>,
-    "net_financial_debt": <number in EUR or null>,
-    "year": <4-digit year or null>,
-    "currency": "EUR" or "USD",
-    "source": "<source name or null>"
+    "annual_revenues": <número en EUR o null si no fiable>,
+    "ebitda": <número en EUR o null>,
+    "net_financial_debt": <número en EUR o null>,
+    "year": <año de los datos como número o null>,
+    "currency": "EUR",
+    "source": "<nombre de la fuente específica>"
 }}
 
-Convert to EUR if needed (use approximate exchange rate).
-If you cannot find reliable data, use null.
+REGLAS CRÍTICAS:
+- NO inventes cifras. Si no hay datos públicos fiables, usa null
+- Convierte a EUR si es necesario (usa tipo de cambio aproximado del año)
+- La fuente debe ser específica (ej: "Memoria Anual 2023", "Registro Mercantil España")
+- Los ingresos deben estar en unidades (no millones). Ej: 50000000 para 50M€
+- Preferir datos más recientes
 """
         
         try:
@@ -408,12 +625,28 @@ If you cannot find reliable data, use null.
             
             # Validate year is recent
             year = result.get("year")
-            if year and (year < current_year - 3 or year > current_year):
+            if year and (year < current_year - 5 or year > current_year):
                 year = None
             
+            # Convert revenues to proper number format if needed
+            revenues = result.get("annual_revenues")
+            if revenues and isinstance(revenues, str):
+                # Handle "50M" or "50.5M" format
+                try:
+                    revenues = float(revenues.replace("M", "").replace("€", "").strip()) * 1_000_000
+                except:
+                    revenues = None
+            
+            ebitda = result.get("ebitda")
+            if ebitda and isinstance(ebitda, str):
+                try:
+                    ebitda = float(ebitda.replace("M", "").replace("€", "").strip()) * 1_000_000
+                except:
+                    ebitda = None
+            
             return FinancialInfo(
-                annual_revenues=result.get("annual_revenues"),
-                ebitda=result.get("ebitda"),
+                annual_revenues=revenues,
+                ebitda=ebitda,
                 net_financial_debt=result.get("net_financial_debt"),
                 year=year,
                 currency=result.get("currency", "EUR"),
@@ -448,35 +681,49 @@ If you cannot find reliable data, use null.
         )
         
         query = f"""
-Search for key executives at "{company_name}".
-{f'Website: {company_url}' if company_url else ''}
+Busca los ejecutivos clave REALES de la empresa "{company_name}".
+{f'Sitio web: {company_url}' if company_url else ''}
 
-Find these roles if possible:
-1. CEO / Director General / Managing Director
+FUENTES PRIORITARIAS:
+1. Página de LinkedIn de la empresa → Sección "Personas"
+2. Sección "Equipo" o "About Us" de la web de la empresa
+3. Perfiles individuales de LinkedIn
+4. Artículos de prensa con nombres verificables
+
+ROLES A BUSCAR (en orden de prioridad):
+1. CEO / Consejero Delegado / Director General / Managing Director
 2. CFO / Director Financiero / Finance Director
 3. COO / Director de Operaciones / Operations Director
+4. CCO / Chief Commercial Officer / Director Comercial
+5. CTO / Director de Tecnología (si aplica)
 
-For each person found, get:
-- Full name (first and last)
-- Exact role/title
-- LinkedIn profile URL (if available)
-- Business email (if publicly available)
+PARA CADA PERSONA, BUSCAR:
+- Nombre completo (nombre y apellidos reales)
+- Cargo/título exacto en la empresa
+- URL de su perfil de LinkedIn (verificar que sea la persona correcta)
+- Email de contacto (solo si es público)
+- Teléfono (solo si es público)
 
-Return ONLY a JSON object with this exact structure:
+Devuelve ÚNICAMENTE un objeto JSON con esta estructura:
 {{
     "key_persons": [
         {{
-            "first_name": "<string>",
-            "last_name": "<string>",
-            "role": "<exact title>",
-            "linkedin_url": "<url or null>",
-            "email": "<email or null>",
-            "phone": "<phone or null>"
+            "first_name": "<nombre>",
+            "last_name": "<apellidos>",
+            "role": "<cargo exacto en la empresa>",
+            "linkedin_url": "<URL del perfil de LinkedIn o null>",
+            "email": "<email profesional o null>",
+            "phone": "<teléfono o null>"
         }}
     ]
 }}
 
-Only include people you can verify. Maximum 5 people.
+REGLAS CRÍTICAS:
+- Solo incluye personas que puedas VERIFICAR en fuentes públicas
+- Los nombres deben ser REALES, no inventados
+- El LinkedIn debe ser de la persona correcta en la empresa correcta
+- NO inventes emails ni teléfonos. Solo datos públicos verificables
+- Máximo 5 personas, priorizando C-suite
 """
         
         try:
@@ -492,13 +739,18 @@ Only include people you can verify. Maximum 5 people.
             key_persons = []
             for person_data in result.get("key_persons", []):
                 if person_data.get("first_name") and person_data.get("last_name"):
+                    # Validate LinkedIn URL format
+                    linkedin = person_data.get("linkedin_url")
+                    if linkedin and "linkedin.com" not in linkedin:
+                        linkedin = None
+                    
                     key_persons.append(KeyPersonInfo(
                         first_name=person_data["first_name"],
                         last_name=person_data["last_name"],
                         role=person_data.get("role", "Executive"),
                         email=person_data.get("email"),
                         phone=person_data.get("phone"),
-                        linkedin_url=person_data.get("linkedin_url"),
+                        linkedin_url=linkedin,
                         is_key_person=True,
                     ))
             
@@ -550,6 +802,19 @@ Only include people you can verify. Maximum 5 people.
             if company_info.hq_address and not existing_fields.get("HQ Address"):
                 update_fields["HQ Address"] = company_info.hq_address
             
+            # NEW: Save scraped content as JSON for future reference
+            if result.scraped_data and result.scraped_data.success:
+                scraped_summary = {
+                    "certifications": result.scraped_data.certifications,
+                    "green_indicators": result.scraped_data.green_indicators,
+                    "activities": result.scraped_data.activities[:3],
+                    "scraped_at": result.scraped_data.scraped_at.isoformat(),
+                }
+                # Store in a text field if available
+                if not existing_fields.get("Scraped_Content"):
+                    import json
+                    update_fields["Scraped_Content"] = json.dumps(scraped_summary, ensure_ascii=False)
+            
             if update_fields:
                 try:
                     self._airtable.update_record("companies", company_id, update_fields)
@@ -560,6 +825,10 @@ Only include people you can verify. Maximum 5 people.
                     )
                 except AirtableError as e:
                     result.errors.append(f"Failed to update company: {e}")
+        
+        # 1b. NEW: Create certificate records for FEI tracking
+        if company_info and company_info.certifications:
+            self._save_certificates(company_id, company_info.certifications, result)
         
         # 2. Create financials record if we have data
         if financial_info and financial_info.has_data():
@@ -673,53 +942,152 @@ Only include people you can verify. Maximum 5 people.
             )
             return None
     
+    def _save_certificates(
+        self,
+        company_id: str,
+        certifications: list[str],
+        result: EnrichmentResult,
+    ) -> None:
+        """Save certificate records to Airtable.
+        
+        Args:
+            company_id: Company record ID
+            certifications: List of certification names found
+            result: EnrichmentResult to update with errors
+        """
+        for cert_name in certifications:
+            try:
+                # Determine certificate type
+                cert_type = "ISO"
+                if "B Corp" in cert_name:
+                    cert_type = "Eco-label"
+                elif "EMAS" in cert_name or "Eco" in cert_name:
+                    cert_type = "Eco-label"
+                elif "LEED" in cert_name or "BREEAM" in cert_name:
+                    cert_type = "Eco-label"
+                elif "FSC" in cert_name or "PEFC" in cert_name:
+                    cert_type = "Eco-label"
+                
+                cert_fields = {
+                    "Company": [company_id],
+                    "Certificate_Type": cert_type,
+                    "Certificate_Name": cert_name,
+                    "Verified": False,  # Needs manual verification
+                    "Source": "Web",
+                }
+                
+                self._airtable.create_record("company_certificates", cert_fields)
+                
+                logger.info(
+                    "certificate_record_created",
+                    company_id=company_id,
+                    certificate=cert_name,
+                )
+            except AirtableError as e:
+                # Don't fail on certificate creation errors
+                logger.warning(
+                    "certificate_creation_failed",
+                    company_id=company_id,
+                    certificate=cert_name,
+                    error=str(e),
+                )
+    
     def enrich_batch(
         self,
         company_ids: list[str],
         include_financials: bool = True,
         include_contacts: bool = True,
+        include_scraping: bool = True,
+        include_linkedin: bool = True,
         dry_run: bool = False,
         on_progress: Optional[callable] = None,
+        max_concurrent: int = 3,
     ) -> list[EnrichmentResult]:
-        """Enrich multiple companies.
+        """Enrich multiple companies with concurrency control.
+        
+        This is a sync wrapper that safely runs the async implementation.
+        """
+        return run_async(
+            self._enrich_batch_async(
+                company_ids=company_ids,
+                include_financials=include_financials,
+                include_contacts=include_contacts,
+                include_scraping=include_scraping,
+                include_linkedin=include_linkedin,
+                dry_run=dry_run,
+                on_progress=on_progress,
+                max_concurrent=max_concurrent,
+            )
+        )
+
+    async def _enrich_batch_async(
+        self,
+        company_ids: list[str],
+        include_financials: bool = True,
+        include_contacts: bool = True,
+        include_scraping: bool = True,
+        include_linkedin: bool = True,
+        dry_run: bool = False,
+        on_progress: Optional[callable] = None,
+        max_concurrent: int = 3,
+    ) -> list[EnrichmentResult]:
+        """Enrich multiple companies with concurrency control.
         
         Args:
             company_ids: List of company record IDs
             include_financials: Whether to search for financial data
             include_contacts: Whether to search for key persons
+            include_scraping: Whether to scrape company websites
+            include_linkedin: Whether to fetch LinkedIn data
             dry_run: If True, don't save changes
             on_progress: Optional callback(current, total, result)
+            max_concurrent: Maximum concurrent enrichments
             
         Returns:
             List of EnrichmentResult for each company
         """
         results = []
         total = len(company_ids)
+        semaphore = asyncio.Semaphore(max_concurrent)
         
         logger.info(
             "batch_enrichment_started",
             total_companies=total,
             include_financials=include_financials,
             include_contacts=include_contacts,
+            include_scraping=include_scraping,
+            include_linkedin=include_linkedin,
             dry_run=dry_run,
+            max_concurrent=max_concurrent,
         )
         
-        for i, company_id in enumerate(company_ids, 1):
-            result = self.enrich_company(
-                company_id=company_id,
-                include_financials=include_financials,
-                include_contacts=include_contacts,
-                dry_run=dry_run,
-            )
-            results.append(result)
-            
-            if on_progress:
-                on_progress(i, total, result)
+        async def enrich_with_semaphore(company_id: str, index: int) -> EnrichmentResult:
+            async with semaphore:
+                result = await self._enrich_company_async(
+                    company_id=company_id,
+                    include_financials=include_financials,
+                    include_contacts=include_contacts,
+                    include_scraping=include_scraping,
+                    include_linkedin=include_linkedin,
+                    dry_run=dry_run,
+                )
+                if on_progress:
+                    on_progress(index, total, result)
+                return result
+        
+        # Run all enrichments with concurrency control
+        tasks = [
+            enrich_with_semaphore(company_id, i + 1)
+            for i, company_id in enumerate(company_ids)
+        ]
+        results = await asyncio.gather(*tasks)
         
         # Log summary
         successful = sum(1 for r in results if r.success)
         contacts_created = sum(r.contacts_created for r in results)
         financials_created = sum(1 for r in results if r.financials_created)
+        certs_found = sum(len(r.certifications_found) for r in results)
+        fei_eligible = sum(1 for r in results if r.has_fei_certificate)
         
         logger.info(
             "batch_enrichment_completed",
@@ -728,6 +1096,8 @@ Only include people you can verify. Maximum 5 people.
             failed=total - successful,
             contacts_created=contacts_created,
             financials_created=financials_created,
+            certifications_found=certs_found,
+            fei_eligible_count=fei_eligible,
         )
         
         return results
