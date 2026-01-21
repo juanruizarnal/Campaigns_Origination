@@ -315,8 +315,13 @@ with tab3:
             filtered_bus = prefill_bus
             st.info("Usando compañías seleccionadas desde Empresas. Completa el contexto para crear la campaña.")
         else:
-            with loading_spinner("Cargando empresas..."):
-                business_units = api.get_business_units(limit=1000, include_company_fields=True)
+            if "campaign_business_units_cache" not in st.session_state:
+                with loading_spinner("Cargando empresas..."):
+                    st.session_state["campaign_business_units_cache"] = api.get_business_units(
+                        limit=1000,
+                        include_company_fields=True,
+                    )
+            business_units = st.session_state["campaign_business_units_cache"]
 
             sector_options = sorted({
                 sector

@@ -1,6 +1,8 @@
 # Full dependency set for Streamlit Cloud (frontend + backend)
 # Install with: pip install -r frontend/requirements.txt
 
+-c ../constraints.txt
+
 # Frontend
 streamlit==1.31.0
 streamlit-option-menu==0.3.6
