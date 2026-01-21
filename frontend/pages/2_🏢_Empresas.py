@@ -74,6 +74,8 @@ if "search_results" not in st.session_state:
     st.session_state.search_results = None
 if "search_selected" not in st.session_state:
     st.session_state.search_selected = set()
+if "search_airtable_map" not in st.session_state:
+    st.session_state.search_airtable_map = {}
 if "airtable_selected" not in st.session_state:
     st.session_state.airtable_selected = set()
 
@@ -125,6 +127,178 @@ def find_similar_company(name: str, airtable_companies: list, threshold: float =
             best_match = company
     
     return best_match
+
+
+def candidate_key(company: dict) -> str:
+    """Build a stable key for a search candidate."""
+    name = company.get("name", company.get("Company Name", ""))
+    url = company.get("home_url", company.get("Home URL", ""))
+    return f"{name.strip().lower()}|{str(url).strip().lower()}"
+
+
+def update_search_airtable_map(candidates: list[dict]) -> None:
+    """Populate Airtable ID map for search candidates."""
+    mapping: dict[str, str] = {}
+    for c in candidates:
+        match = c.get("_airtable_match") or {}
+        company_id = match.get("id")
+        if company_id:
+            mapping[candidate_key(c)] = company_id
+    st.session_state.search_airtable_map = mapping
+
+
+def render_enrichment_results(state_key: str, close_key: str) -> None:
+    """Render enrichment results section for a given state key."""
+    enrichment = st.session_state.get(state_key)
+    if not enrichment:
+        return
+
+    enrichment_type = enrichment.get("type")
+    enrichment_data = enrichment.get("data", [])
+
+    st.markdown("---")
+
+    col1, col2 = st.columns([6, 1])
+    with col1:
+        st.markdown("### 📊 Resultados del Enriquecimiento")
+    with col2:
+        if st.button("❌ Cerrar", key=close_key):
+            st.session_state[state_key] = None
+            st.rerun()
+
+    if enrichment_type == "financial":
+        successful = [r for r in enrichment_data if r.get("success")]
+        failed = [r for r in enrichment_data if not r.get("success")]
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("✅ Éxito", len(successful))
+        with col2:
+            st.metric("❌ Errores", len(failed))
+
+        if successful:
+            st.markdown("#### Datos Encontrados:")
+            df_data = []
+            for r in successful:
+                df_data.append({
+                    "Empresa": r["company_name"],
+                    "Empleados": r.get("employees") or "N/A",
+                    "Facturación": format_currency(r.get("revenues")) if r.get("revenues") else "N/A",
+                    "EBITDA": format_currency(r.get("ebitda")) if r.get("ebitda") else "N/A",
+                    "LinkedIn": "✓" if r.get("linkedin") else "✗",
+                })
+            st.dataframe(pd.DataFrame(df_data), use_container_width=True, hide_index=True)
+
+        if failed:
+            with st.expander(f"❌ Ver {len(failed)} errores"):
+                for r in failed:
+                    st.error(f"**{r['company_name']}**: {r.get('error', 'Error desconocido')}")
+
+        st.success("✅ Los datos se han guardado automáticamente en Airtable.")
+
+    elif enrichment_type == "fei":
+        eligible = [r for r in enrichment_data if r.get("status") == "Eligible"]
+        not_eligible = [r for r in enrichment_data if r.get("status") == "Not_Eligible"]
+        pending = [r for r in enrichment_data if r.get("status") not in ["Eligible", "Not_Eligible"]]
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("✅ Elegibles", len(eligible))
+        with col2:
+            st.metric("❌ No Elegibles", len(not_eligible))
+        with col3:
+            st.metric("⏳ Pendientes/Otros", len(pending))
+
+        st.markdown("#### Resultados Detallados:")
+        df_data = []
+        for r in enrichment_data:
+            emoji = get_fei_status_emoji(r.get("status", "Unknown"))
+            df_data.append({
+                "Empresa": r["company_name"],
+                "Estado": f"{emoji} {r.get('status', 'Unknown')}",
+                "Confianza": f"{r.get('confidence', 0)*100:.0f}%" if r.get("confidence") else "N/A",
+                "Criterios": ", ".join(r.get("criteria_met", [])) or "Ninguno",
+            })
+        st.dataframe(pd.DataFrame(df_data), use_container_width=True, hide_index=True)
+
+        if eligible:
+            with st.expander("📝 Ver razonamiento de empresas elegibles"):
+                for r in eligible:
+                    st.markdown(f"**{r['company_name']}:**")
+                    st.markdown(f"> {r.get('reasoning', 'Sin razonamiento disponible')}")
+                    st.markdown("---")
+
+        st.success("✅ Las evaluaciones FEI se han guardado automáticamente en Airtable.")
+
+    elif enrichment_type == "contacts":
+        total_contacts = sum(len(r.get("contacts", [])) for r in enrichment_data)
+        total_created = sum(r.get("contacts_created", 0) for r in enrichment_data)
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("👥 Contactos Encontrados", total_contacts)
+        with col2:
+            st.metric("💾 Creados en Airtable", total_created)
+
+        if total_contacts > 0:
+            st.markdown("#### Contactos por Empresa:")
+
+            for r in enrichment_data:
+                contacts = r.get("contacts", [])
+                if contacts:
+                    st.markdown(f"**{r['company_name']}** ({len(contacts)} contactos)")
+
+                    contact_data = []
+                    for c in contacts:
+                        contact_data.append({
+                            "Nombre": c.get("name", "N/A"),
+                            "Cargo": c.get("role", "N/A"),
+                            "Email": c.get("email", "N/A"),
+                            "LinkedIn": "✓" if c.get("linkedin") else "✗",
+                        })
+                    st.dataframe(pd.DataFrame(contact_data), use_container_width=True, hide_index=True)
+                elif r.get("error"):
+                    st.warning(f"**{r['company_name']}**: {r['error']}")
+
+        st.success("✅ Los contactos encontrados se han guardado automáticamente en Airtable.")
+
+    elif enrichment_type == "structure":
+        successful = [r for r in enrichment_data if r.get("success")]
+
+        st.markdown("#### Estructura Corporativa:")
+        for r in enrichment_data:
+            with st.expander(f"**{r['company_name']}**"):
+                if r.get("parent_company"):
+                    st.markdown(f"**Parent:** {r['parent_company']}")
+                if r.get("ultimate_parent"):
+                    st.markdown(f"**Ultimate Parent:** {r['ultimate_parent']}")
+                if r.get("subsidiaries"):
+                    st.markdown(f"**Subsidiarias:** {', '.join(r['subsidiaries'])}")
+                if r.get("error"):
+                    st.error(r["error"])
+
+        st.success(f"✅ Estructura analizada para {len(successful)}/{len(enrichment_data)} empresas.")
+
+    elif enrichment_type == "business_units":
+        total_created = sum(r.get("bus_created", 0) for r in enrichment_data)
+        total_updated = sum(r.get("bus_updated", 0) for r in enrichment_data)
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("✅ Nuevas BU", total_created)
+        with col2:
+            st.metric("🔄 Actualizadas", total_updated)
+
+        for r in enrichment_data:
+            with st.expander(f"**{r['company_name']}**"):
+                if r.get("bus_list"):
+                    st.markdown("**Business Units:**")
+                    for bu in r["bus_list"]:
+                        st.markdown(f"- {bu}")
+                if r.get("error"):
+                    st.error(r["error"])
+
+        st.success("✅ Business Units sincronizadas con Airtable.")
 
 
 def get_airtable_url(record_id: str) -> str:
@@ -477,8 +651,6 @@ with tab1:
                                     airtable_match = find_similar_company(c_name, airtable_companies)
                                     c["_airtable_match"] = airtable_match
                                     c["_is_in_airtable"] = airtable_match is not None
-                                    if airtable_match and c["_is_in_airtable"]:
-                                        c["_airtable_id"] = airtable_match.get("id")
                                     all_results.append(c)
                 
                 all_results = all_results[:max_companies]
@@ -489,6 +661,7 @@ with tab1:
             }
             st.session_state.search_selected = set()
             st.session_state.tab1_enrichment = None
+            update_search_airtable_map(all_results)
             
             st.success(f"✅ Encontradas {len(all_results)} empresas")
     
@@ -614,14 +787,16 @@ with tab1:
                     key="t1_save_new",
                 ):
                     with st.spinner(f"Guardando {len(truly_new)} empresas..."):
+                        candidate_keys = [candidate_key(c) for c in truly_new]
                         result = api.save_companies(truly_new)
                     
                     if result.get("success"):
                         st.success(f"✅ {len(result.get('companies_created', []))} empresas guardadas")
+                        created_ids = result.get("companies_created", [])
+                        for key, company_id in zip(candidate_keys, created_ids):
+                            if company_id:
+                                st.session_state.search_airtable_map[key] = company_id
                         st.session_state.all_airtable_companies = None
-                        for c in truly_new:
-                            if c.get("created_company_id"):
-                                c["_airtable_id"] = c.get("created_company_id")
                         st.info("💡 Ve a 'Empresas en Airtable' para enriquecer los datos.")
                     else:
                         st.error(f"Error: {result.get('errors', [])}")
@@ -708,8 +883,12 @@ with tab1:
                                 result = api.save_companies([company])
                                 if result.get("success"):
                                     saved_new += 1
-                                    if company.get("created_company_id"):
-                                        company["_airtable_id"] = company.get("created_company_id")
+                                    created_id = None
+                                    created_ids = result.get("companies_created", [])
+                                    if created_ids:
+                                        created_id = created_ids[0]
+                                    if created_id:
+                                        st.session_state.search_airtable_map[candidate_key(company)] = created_id
                                 else:
                                     errors.extend(result.get("errors", []))
                             elif decision == "new_bu":
@@ -728,7 +907,7 @@ with tab1:
                                     )
                                     if bu_result.get("success"):
                                         created_bus += 1
-                                        company["_airtable_id"] = match_id
+                                        st.session_state.search_airtable_map[candidate_key(company)] = match_id
                                     else:
                                         errors.extend(bu_result.get("errors", []))
                     
@@ -751,506 +930,385 @@ with tab1:
                 st.markdown("---")
                 st.info(f"ℹ️ **{len(already_exists)} empresas** ya están en Airtable. Puedes enriquecerlas en la pestaña 'Empresas en Airtable'.")
 
-
-
-            # Section 4: Enriquecimiento desde resultados de búsqueda
+            # ===== Enrichment actions for search results =====
             st.markdown("---")
-            st.markdown("### ⚙️ Enriquecimiento (Resultados de búsqueda)")
+            st.markdown("### ⚡ Acciones de Enriquecimiento (Airtable)")
+            st.info("📌 Guarda o vincula empresas en Airtable para poder enriquecerlas desde aquí.")
 
-            # Build enrichable list (only saved or matched companies)
-            enrichable_companies = []
-            skipped_enrich = []
-            for c in selected_candidates:
-                airtable_id = c.get("created_company_id") or c.get("_airtable_id")
-                if not airtable_id and c.get("_airtable_match"):
-                    airtable_id = c.get("_airtable_match", {}).get("id")
-                if airtable_id:
-                    name = c.get("name", c.get("Company Name", "N/A"))
-                    url = c.get("home_url", c.get("Home URL", ""))
-                    enrichable_companies.append({
-                        "id": airtable_id,
-                        "fields": {
-                            "Company Name": name,
-                            "Home URL": url,
-                        },
-                    })
-                else:
-                    skipped_enrich.append(c)
+            selected_indices = list(st.session_state.search_selected)
+            selected_candidates = [candidates[i] for i in selected_indices if i < len(candidates)]
 
-            if skipped_enrich:
-                st.warning(
-                    f"⚠️ {len(skipped_enrich)} empresas seleccionadas no están guardadas en Airtable. "
-                    "Guárdalas primero para poder enriquecer."
+            selected_airtable_companies = []
+            missing_enrichment = []
+
+            for company in selected_candidates:
+                key = candidate_key(company)
+                company_id = st.session_state.search_airtable_map.get(key)
+
+                if not company_id:
+                    match = company.get("_airtable_match") or {}
+                    company_id = match.get("id")
+
+                if not company_id:
+                    missing_enrichment.append(company)
+                    continue
+
+                company_name = company.get("name", company.get("Company Name", "N/A"))
+                company_url = company.get("home_url", company.get("Home URL", ""))
+
+                match_fields = (company.get("_airtable_match") or {}).get("fields", {})
+                if match_fields:
+                    company_name = match_fields.get("Company Name", company_name)
+                    company_url = match_fields.get("Home URL", company_url)
+
+                selected_airtable_companies.append({
+                    "id": company_id,
+                    "fields": {
+                        "Company Name": company_name,
+                        "Home URL": company_url,
+                    }
+                })
+
+            if missing_enrichment:
+                st.warning(f"⚠️ {len(missing_enrichment)} seleccionadas no están guardadas en Airtable. Guárdalas para enriquecer.")
+
+            has_airtable_selection = len(selected_airtable_companies) > 0
+
+            action_cols = st.columns(5)
+
+            with action_cols[0]:
+                t1_btn_financial = st.button(
+                    "💰 Datos Financieros",
+                    use_container_width=True,
+                    disabled=not has_airtable_selection,
+                    key="t1_btn_financial",
                 )
 
-            if not enrichable_companies:
-                st.info("Selecciona empresas guardadas o con match en Airtable para ejecutar enriquecimientos.")
-            else:
-                action_cols = st.columns(5)
-                with action_cols[0]:
-                    t1_btn_financial = st.button(
-                        "💰 Financieros",
-                        use_container_width=True,
-                        key="t1_btn_financial",
-                    )
-                with action_cols[1]:
-                    t1_btn_structure = st.button(
-                        "🏛️ Estructura",
-                        use_container_width=True,
-                        key="t1_btn_structure",
-                    )
-                with action_cols[2]:
-                    t1_btn_fei = st.button(
-                        "🏷️ FEI",
-                        use_container_width=True,
-                        key="t1_btn_fei",
-                    )
-                with action_cols[3]:
-                    t1_btn_bus = st.button(
-                        "🏢 Business Units",
-                        use_container_width=True,
-                        key="t1_btn_bus",
-                    )
-                with action_cols[4]:
-                    t1_btn_contacts = st.button(
-                        "👥 Contactos",
-                        use_container_width=True,
-                        key="t1_btn_contacts",
-                    )
-
-                # ========== PROCESS ENRICHMENT ACTIONS ==========
-                if t1_btn_financial:
-                    st.markdown("---")
-                    st.markdown("### 💰 Enriqueciendo Datos Financieros...")
-
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
-
-                    results = []
-                    for idx, company in enumerate(enrichable_companies):
-                        fields = company.get("fields", {})
-                        company_name = fields.get("Company Name", "N/A")
-                        company_id = company.get("id")
-                        company_url = fields.get("Home URL", "")
-
-                        status_text.text(f"Procesando {idx+1}/{len(enrichable_companies)}: {company_name}")
-                        progress_bar.progress((idx + 1) / len(enrichable_companies))
-
-                        result_entry = {
-                            "company_name": company_name,
-                            "company_id": company_id,
-                            "success": False,
-                            "employees": None,
-                            "revenues": None,
-                            "ebitda": None,
-                            "linkedin": None,
-                            "error": None,
-                        }
-
-                        try:
-                            enrich_result = api.enrich_company(
-                                company_id,
-                                company_name=company_name,
-                                company_url=company_url,
-                                include_financials=True,
-                                include_contacts=False,
-                            )
-
-                            if hasattr(enrich_result, "success") and enrich_result.success:
-                                result_entry["success"] = True
-                                if hasattr(enrich_result, "company_info") and enrich_result.company_info:
-                                    result_entry["employees"] = enrich_result.company_info.num_employees
-                                    result_entry["linkedin"] = enrich_result.company_info.linkedin_url
-                                if hasattr(enrich_result, "financial_info") and enrich_result.financial_info:
-                                    result_entry["revenues"] = enrich_result.financial_info.annual_revenues
-                                    result_entry["ebitda"] = enrich_result.financial_info.ebitda
-                            elif isinstance(enrich_result, dict):
-                                result_entry["success"] = enrich_result.get("success", False)
-                                if result_entry["success"]:
-                                    result_entry["employees"] = enrich_result.get("num_employees")
-                                    result_entry["revenues"] = enrich_result.get("revenues")
-                                    result_entry["ebitda"] = enrich_result.get("ebitda")
-                                    result_entry["linkedin"] = enrich_result.get("linkedin_url")
-                                result_entry["error"] = str(enrich_result.get("errors", [])) if not result_entry["success"] else None
-                            else:
-                                result_entry["error"] = "Resultado no reconocido"
-
-                        except Exception as e:
-                            result_entry["error"] = str(e)
-
-                        results.append(result_entry)
-
-                    progress_bar.empty()
-                    status_text.empty()
-
-                    st.session_state.tab1_enrichment = {"type": "financial", "data": results}
-
-                if t1_btn_fei:
-                    st.markdown("---")
-                    st.markdown("### 🏷️ Evaluando Elegibilidad FEI...")
-
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
-
-                    results = []
-                    for idx, company in enumerate(enrichable_companies):
-                        fields = company.get("fields", {})
-                        company_name = fields.get("Company Name", "N/A")
-                        company_id = company.get("id")
-
-                        status_text.text(f"Evaluando {idx+1}/{len(enrichable_companies)}: {company_name}")
-                        progress_bar.progress((idx + 1) / len(enrichable_companies))
-
-                        result_entry = {
-                            "company_name": company_name,
-                            "company_id": company_id,
-                            "status": "Unknown",
-                            "confidence": 0,
-                            "criteria_met": [],
-                            "reasoning": "",
-                            "error": None,
-                        }
-
-                        try:
-                            fei_result = api.evaluate_fei(company_id, force=True)
-
-                            if hasattr(fei_result, "status"):
-                                status_val = fei_result.status.value if hasattr(fei_result.status, "value") else str(fei_result.status)
-                                result_entry["status"] = status_val
-                                result_entry["confidence"] = getattr(fei_result, "confidence", 0)
-
-                                criteria = getattr(fei_result, "criteria_met", [])
-                                if criteria:
-                                    result_entry["criteria_met"] = [c.value if hasattr(c, "value") else str(c) for c in criteria]
-
-                                result_entry["reasoning"] = getattr(fei_result, "reasoning", "")
-                            elif isinstance(fei_result, dict):
-                                result_entry["status"] = fei_result.get("status", "Unknown")
-                                result_entry["confidence"] = fei_result.get("confidence", 0)
-                                result_entry["criteria_met"] = fei_result.get("criteria_met", [])
-                                result_entry["reasoning"] = fei_result.get("reasoning", "")
-                                result_entry["error"] = str(fei_result.get("errors", [])) if fei_result.get("errors") else None
-                            else:
-                                result_entry["error"] = "Resultado no reconocido"
-
-                        except Exception as e:
-                            result_entry["error"] = str(e)
-
-                        results.append(result_entry)
-
-                    progress_bar.empty()
-                    status_text.empty()
-
-                    st.session_state.tab1_enrichment = {"type": "fei", "data": results}
-
-                if t1_btn_contacts:
-                    st.markdown("---")
-                    st.markdown("### 👥 Buscando Contactos...")
-
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
-
-                    results = []
-                    for idx, company in enumerate(enrichable_companies):
-                        fields = company.get("fields", {})
-                        company_name = fields.get("Company Name", "N/A")
-                        company_id = company.get("id")
-                        company_url = fields.get("Home URL", "")
-
-                        status_text.text(f"Buscando {idx+1}/{len(enrichable_companies)}: {company_name}")
-                        progress_bar.progress((idx + 1) / len(enrichable_companies))
-
-                        result_entry = {
-                            "company_name": company_name,
-                            "company_id": company_id,
-                            "contacts": [],
-                            "contacts_created": 0,
-                            "error": None,
-                        }
-
-                        try:
-                            contacts_result = api.enrich_company(
-                                company_id,
-                                company_name=company_name,
-                                company_url=company_url,
-                                include_financials=False,
-                                include_contacts=True,
-                            )
-
-                            if isinstance(contacts_result, dict):
-                                result_entry["contacts"] = contacts_result.get("key_persons", [])
-                                result_entry["contacts_created"] = contacts_result.get("contacts_created", 0)
-                                result_entry["error"] = str(contacts_result.get("errors", [])) if not contacts_result.get("success", False) else None
-                            else:
-                                result_entry["error"] = "Resultado no reconocido"
-
-                        except Exception as e:
-                            result_entry["error"] = str(e)
-
-                        results.append(result_entry)
-
-                    progress_bar.empty()
-                    status_text.empty()
-
-                    st.session_state.tab1_enrichment = {"type": "contacts", "data": results}
-
-                if t1_btn_structure:
-                    st.markdown("---")
-                    st.markdown("### 🏛️ Analizando Estructura Corporativa...")
-
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
-
-                    results = []
-                    for idx, company in enumerate(enrichable_companies):
-                        fields = company.get("fields", {})
-                        company_name = fields.get("Company Name", "N/A")
-                        company_id = company.get("id")
-                        company_url = fields.get("Home URL", "")
-
-                        status_text.text(f"Analizando {idx+1}/{len(enrichable_companies)}: {company_name}")
-                        progress_bar.progress((idx + 1) / len(enrichable_companies))
-
-                        result_entry = {
-                            "company_name": company_name,
-                            "company_id": company_id,
-                            "parent_company": None,
-                            "subsidiaries": [],
-                            "success": False,
-                            "error": None,
-                        }
-
-                        try:
-                            structure_result = api.enrich_company(
-                                company_id,
-                                company_name=company_name,
-                                company_url=company_url,
-                                include_financials=False,
-                                include_contacts=False,
-                            )
-
-                            if hasattr(structure_result, "company_info") and structure_result.company_info:
-                                info = structure_result.company_info
-                                result_entry["parent_company"] = getattr(info, "parent_company", None)
-                                result_entry["subsidiaries"] = getattr(info, "subsidiaries", [])
-                                result_entry["success"] = True
-                            elif isinstance(structure_result, dict):
-                                result_entry["parent_company"] = structure_result.get("parent_company")
-                                result_entry["subsidiaries"] = structure_result.get("subsidiaries", [])
-                                result_entry["success"] = structure_result.get("success", False)
-                                if not result_entry["success"]:
-                                    result_entry["error"] = str(structure_result.get("errors", []))
-                            else:
-                                result_entry["error"] = "Resultado no reconocido"
-
-                        except Exception as e:
-                            result_entry["error"] = str(e)
-
-                        results.append(result_entry)
-
-                    progress_bar.empty()
-                    status_text.empty()
-
-                    st.session_state.tab1_enrichment = {"type": "structure", "data": results}
-
-                if t1_btn_bus:
-                    st.markdown("---")
-                    st.markdown("### 🏢 Gestionando Business Units...")
-
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
-
-                    results = []
-                    for idx, company in enumerate(enrichable_companies):
-                        fields = company.get("fields", {})
-                        company_name = fields.get("Company Name", "N/A")
-                        company_id = company.get("id")
-
-                        status_text.text(f"Procesando {idx+1}/{len(enrichable_companies)}: {company_name}")
-                        progress_bar.progress((idx + 1) / len(enrichable_companies))
-
-                        result_entry = {
-                            "company_name": company_name,
-                            "company_id": company_id,
-                            "bus_created": 0,
-                            "bus_updated": 0,
-                            "bus_list": [],
-                            "success": False,
-                            "error": None,
-                        }
-
-                        try:
-                            bu_result = api.get_or_create_business_units(company_id, company_name)
-                            if isinstance(bu_result, dict):
-                                result_entry["bus_created"] = bu_result.get("created", 0)
-                                result_entry["bus_updated"] = bu_result.get("updated", 0)
-                                result_entry["bus_list"] = bu_result.get("business_units", [])
-                                result_entry["success"] = bu_result.get("success", False)
-                                if not result_entry["success"]:
-                                    result_entry["error"] = str(bu_result.get("errors", []))
-                            else:
-                                result_entry["success"] = True
-                                result_entry["bus_created"] = 1
-
-                        except Exception as e:
-                            result_entry["error"] = str(e)
-
-                        results.append(result_entry)
-
-                    progress_bar.empty()
-                    status_text.empty()
-
-                    st.session_state.tab1_enrichment = {"type": "business_units", "data": results}
-
-                # ========== DISPLAY ENRICHMENT RESULTS ==========
-                if st.session_state.tab1_enrichment:
-                    enrichment = st.session_state.tab1_enrichment
-                    enrichment_type = enrichment.get("type")
-                    enrichment_data = enrichment.get("data", [])
-
-                    st.markdown("---")
-
-                    col1, col2 = st.columns([6, 1])
-                    with col1:
-                        st.markdown("### 📊 Resultados del Enriquecimiento")
-                    with col2:
-                        if st.button("❌ Cerrar", key="t1_close_enrichment"):
-                            st.session_state.tab1_enrichment = None
-                            st.rerun()
-
-                    if enrichment_type == "financial":
-                        successful = [r for r in enrichment_data if r.get("success")]
-                        failed = [r for r in enrichment_data if not r.get("success")]
-
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.metric("✅ Éxito", len(successful))
-                        with col2:
-                            st.metric("❌ Errores", len(failed))
-
-                        if successful:
-                            st.markdown("#### Datos Encontrados:")
-                            df_data = []
-                            for r in successful:
-                                df_data.append({
-                                    "Empresa": r["company_name"],
-                                    "Empleados": r.get("employees") or "N/A",
-                                    "Facturación": format_currency(r.get("revenues")) if r.get("revenues") else "N/A",
-                                    "EBITDA": format_currency(r.get("ebitda")) if r.get("ebitda") else "N/A",
-                                    "LinkedIn": "✓" if r.get("linkedin") else "✗",
-                                })
-                            st.dataframe(pd.DataFrame(df_data), use_container_width=True, hide_index=True)
-
-                        if failed:
-                            with st.expander(f"❌ Ver {len(failed)} errores"):
-                                for r in failed:
-                                    st.error(f"**{r['company_name']}**: {r.get('error', 'Error desconocido')}")
-
-                        st.success("✅ Los datos se han guardado automáticamente en Airtable.")
-
-                    elif enrichment_type == "fei":
-                        eligible = [r for r in enrichment_data if r.get("status") == "Eligible"]
-                        not_eligible = [r for r in enrichment_data if r.get("status") == "Not_Eligible"]
-                        pending = [r for r in enrichment_data if r.get("status") not in ["Eligible", "Not_Eligible"]]
-
-                        col1, col2, col3 = st.columns(3)
-                        with col1:
-                            st.metric("✅ Elegibles", len(eligible))
-                        with col2:
-                            st.metric("❌ No Elegibles", len(not_eligible))
-                        with col3:
-                            st.metric("⏳ Pendientes/Otros", len(pending))
-
-                        st.markdown("#### Resultados Detallados:")
-                        df_data = []
-                        for r in enrichment_data:
-                            emoji = get_fei_status_emoji(r.get("status", "Unknown"))
-                            df_data.append({
-                                "Empresa": r["company_name"],
-                                "Estado": f"{emoji} {r.get('status', 'Unknown')}",
-                                "Confianza": f"{r.get('confidence', 0)*100:.0f}%" if r.get("confidence") else "N/A",
-                                "Criterios": ", ".join(r.get("criteria_met", [])) or "Ninguno",
-                            })
-                        st.dataframe(pd.DataFrame(df_data), use_container_width=True, hide_index=True)
-
-                        if eligible:
-                            with st.expander("📝 Ver razonamiento de empresas elegibles"):
-                                for r in eligible:
-                                    st.markdown(f"**{r['company_name']}:**")
-                                    st.markdown(f"> {r.get('reasoning', 'Sin razonamiento disponible')}")
-                                    st.markdown("---")
-
-                        st.success("✅ Las evaluaciones FEI se han guardado automáticamente en Airtable.")
-
-                    elif enrichment_type == "contacts":
-                        total_contacts = sum(len(r.get("contacts", [])) for r in enrichment_data)
-                        total_created = sum(r.get("contacts_created", 0) for r in enrichment_data)
-
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.metric("👥 Contactos Encontrados", total_contacts)
-                        with col2:
-                            st.metric("💾 Creados en Airtable", total_created)
-
-                        if total_contacts > 0:
-                            st.markdown("#### Contactos por Empresa:")
-
-                            for r in enrichment_data:
-                                contacts = r.get("contacts", [])
-                                if contacts:
-                                    st.markdown(f"**{r['company_name']}** ({len(contacts)} contactos)")
-
-                                    contact_data = []
-                                    for c in contacts:
-                                        contact_data.append({
-                                            "Nombre": c.get("name", "N/A"),
-                                            "Cargo": c.get("role", "N/A"),
-                                            "Email": c.get("email", "N/A"),
-                                            "LinkedIn": "✓" if c.get("linkedin") else "✗",
-                                        })
-                                    st.dataframe(pd.DataFrame(contact_data), use_container_width=True, hide_index=True)
-                                elif r.get("error"):
-                                    st.warning(f"**{r['company_name']}**: {r['error']}")
-
-                        st.success("✅ Los contactos encontrados se han guardado automáticamente en Airtable.")
-
-                    elif enrichment_type == "structure":
-                        st.markdown("#### Estructura Corporativa:")
-                        for r in enrichment_data:
-                            with st.expander(f"**{r['company_name']}**"):
-                                if r.get("parent_company"):
-                                    st.markdown(f"🏛️ **Empresa Matriz:** {r['parent_company']}")
-                                else:
-                                    st.markdown("🏛️ **Empresa Matriz:** No identificada")
-
-                                subs = r.get("subsidiaries", [])
-                                if subs:
-                                    st.markdown(f"🏢 **Subsidiarias:** {len(subs)}")
-                                    for sub in subs[:10]:
-                                        st.markdown(f"  - {sub}")
-                                else:
-                                    st.markdown("🏢 **Subsidiarias:** No identificadas")
-
-                                if r.get("error"):
-                                    st.error(f"Error: {r['error']}")
-
-                    elif enrichment_type == "business_units":
-                        total_created = sum(r.get("bus_created", 0) for r in enrichment_data)
-                        total_updated = sum(r.get("bus_updated", 0) for r in enrichment_data)
-
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.metric("🆕 Business Units creadas", total_created)
-                        with col2:
-                            st.metric("🔄 Business Units actualizadas", total_updated)
-
-                        for r in enrichment_data:
-                            with st.expander(f"**{r['company_name']}**"):
-                                bus_list = r.get("bus_list", [])
-                                if bus_list:
-                                    st.dataframe(pd.DataFrame(bus_list), use_container_width=True, hide_index=True)
-                                elif r.get("error"):
-                                    st.error(f"Error: {r['error']}")
+            with action_cols[1]:
+                t1_btn_structure = st.button(
+                    "🏗️ Estructura",
+                    use_container_width=True,
+                    disabled=not has_airtable_selection,
+                    key="t1_btn_structure",
+                )
+
+            with action_cols[2]:
+                t1_btn_fei = st.button(
+                    "🏷️ Evaluación FEI",
+                    use_container_width=True,
+                    disabled=not has_airtable_selection,
+                    key="t1_btn_fei",
+                )
+
+            with action_cols[3]:
+                t1_btn_bus = st.button(
+                    "🏢 Business Units",
+                    use_container_width=True,
+                    disabled=not has_airtable_selection,
+                    key="t1_btn_bus",
+                )
+
+            with action_cols[4]:
+                t1_btn_contacts = st.button(
+                    "👥 Buscar Contactos",
+                    use_container_width=True,
+                    disabled=not has_airtable_selection,
+                    key="t1_btn_contacts",
+                )
+
+            if t1_btn_financial and has_airtable_selection:
+                st.markdown("---")
+                st.markdown("### 💰 Enriqueciendo Datos Financieros...")
+
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+
+                results = []
+                for idx, company in enumerate(selected_airtable_companies):
+                    fields = company.get("fields", {})
+                    company_name = fields.get("Company Name", "N/A")
+                    company_id = company.get("id")
+                    company_url = fields.get("Home URL", "")
+
+                    status_text.text(f"Procesando {idx+1}/{len(selected_airtable_companies)}: {company_name}")
+                    progress_bar.progress((idx + 1) / len(selected_airtable_companies))
+
+                    result_entry = {
+                        "company_name": company_name,
+                        "company_id": company_id,
+                        "success": False,
+                        "employees": None,
+                        "revenues": None,
+                        "ebitda": None,
+                        "linkedin": None,
+                        "error": None,
+                    }
+
+                    try:
+                        enrich_result = api.enrich_company(
+                            company_id,
+                            company_name=company_name,
+                            company_url=company_url,
+                            include_financials=True,
+                            include_contacts=False,
+                        )
+
+                        if hasattr(enrich_result, "success") and enrich_result.success:
+                            result_entry["success"] = True
+                            if hasattr(enrich_result, "company_info") and enrich_result.company_info:
+                                result_entry["employees"] = enrich_result.company_info.num_employees
+                                result_entry["linkedin"] = enrich_result.company_info.linkedin_url
+                            if hasattr(enrich_result, "financial_info") and enrich_result.financial_info:
+                                result_entry["revenues"] = enrich_result.financial_info.annual_revenues
+                                result_entry["ebitda"] = enrich_result.financial_info.ebitda
+                        elif isinstance(enrich_result, dict):
+                            result_entry["success"] = enrich_result.get("success", False)
+                            if result_entry["success"]:
+                                result_entry["employees"] = enrich_result.get("num_employees")
+                                result_entry["revenues"] = enrich_result.get("revenues")
+                                result_entry["ebitda"] = enrich_result.get("ebitda")
+                                result_entry["linkedin"] = enrich_result.get("linkedin_url")
+                            result_entry["error"] = str(enrich_result.get("errors", [])) if not result_entry["success"] else None
+                        else:
+                            result_entry["error"] = "Resultado no reconocido"
+
+                    except Exception as e:
+                        result_entry["error"] = str(e)
+
+                    results.append(result_entry)
+
+                progress_bar.empty()
+                status_text.empty()
+
+                st.session_state.tab1_enrichment = {"type": "financial", "data": results}
+
+            if t1_btn_fei and has_airtable_selection:
+                st.markdown("---")
+                st.markdown("### 🏷️ Evaluando Elegibilidad FEI...")
+
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+
+                results = []
+                for idx, company in enumerate(selected_airtable_companies):
+                    fields = company.get("fields", {})
+                    company_name = fields.get("Company Name", "N/A")
+                    company_id = company.get("id")
+
+                    status_text.text(f"Evaluando {idx+1}/{len(selected_airtable_companies)}: {company_name}")
+                    progress_bar.progress((idx + 1) / len(selected_airtable_companies))
+
+                    result_entry = {
+                        "company_name": company_name,
+                        "company_id": company_id,
+                        "status": "Unknown",
+                        "confidence": 0,
+                        "criteria_met": [],
+                        "reasoning": "",
+                        "error": None,
+                    }
+
+                    try:
+                        fei_result = api.evaluate_fei(company_id, force=True)
+
+                        if hasattr(fei_result, "status"):
+                            status_val = fei_result.status.value if hasattr(fei_result.status, "value") else str(fei_result.status)
+                            result_entry["status"] = status_val
+                            result_entry["confidence"] = getattr(fei_result, "confidence", 0)
+
+                            criteria = getattr(fei_result, "criteria_met", [])
+                            if criteria:
+                                result_entry["criteria_met"] = [c.value if hasattr(c, "value") else str(c) for c in criteria]
+
+                            result_entry["reasoning"] = getattr(fei_result, "reasoning", "")
+                        elif isinstance(fei_result, dict):
+                            result_entry["status"] = fei_result.get("status", "Unknown")
+                            result_entry["confidence"] = fei_result.get("confidence", 0)
+                            result_entry["criteria_met"] = fei_result.get("criteria_met", [])
+                            result_entry["reasoning"] = fei_result.get("reasoning", "")
+                            result_entry["error"] = str(fei_result.get("errors", [])) if fei_result.get("errors") else None
+                        else:
+                            result_entry["error"] = "Resultado no reconocido"
+
+                    except Exception as e:
+                        result_entry["error"] = str(e)
+
+                    results.append(result_entry)
+
+                progress_bar.empty()
+                status_text.empty()
+
+                st.session_state.tab1_enrichment = {"type": "fei", "data": results}
+
+            if t1_btn_contacts and has_airtable_selection:
+                st.markdown("---")
+                st.markdown("### 👥 Buscando Contactos...")
+
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+
+                results = []
+                for idx, company in enumerate(selected_airtable_companies):
+                    fields = company.get("fields", {})
+                    company_name = fields.get("Company Name", "N/A")
+                    company_id = company.get("id")
+                    company_url = fields.get("Home URL", "")
+
+                    status_text.text(f"Buscando {idx+1}/{len(selected_airtable_companies)}: {company_name}")
+                    progress_bar.progress((idx + 1) / len(selected_airtable_companies))
+
+                    result_entry = {
+                        "company_name": company_name,
+                        "company_id": company_id,
+                        "contacts": [],
+                        "contacts_created": 0,
+                        "error": None,
+                    }
+
+                    try:
+                        contacts_result = api.enrich_company(
+                            company_id,
+                            company_name=company_name,
+                            company_url=company_url,
+                            include_financials=False,
+                            include_contacts=True,
+                        )
+
+                        if hasattr(contacts_result, "key_persons") and contacts_result.key_persons:
+                            result_entry["contacts"] = [
+                                {
+                                    "name": p.get("name", ""),
+                                    "role": p.get("role", ""),
+                                    "email": p.get("email", ""),
+                                    "linkedin": p.get("linkedin_url", ""),
+                                }
+                                for p in contacts_result.key_persons
+                            ]
+                            result_entry["contacts_created"] = len(contacts_result.key_persons)
+                        elif isinstance(contacts_result, dict):
+                            persons = contacts_result.get("key_persons", [])
+                            result_entry["contacts"] = persons
+                            result_entry["contacts_created"] = contacts_result.get("contacts_created", len(persons))
+                            if not contacts_result.get("success"):
+                                result_entry["error"] = str(contacts_result.get("errors", []))
+                        else:
+                            result_entry["error"] = "Resultado no reconocido"
+
+                    except Exception as e:
+                        result_entry["error"] = str(e)
+
+                    results.append(result_entry)
+
+                progress_bar.empty()
+                status_text.empty()
+
+                st.session_state.tab1_enrichment = {"type": "contacts", "data": results}
+
+            if t1_btn_structure and has_airtable_selection:
+                st.markdown("---")
+                st.markdown("### 🏗️ Analizando Estructura Corporativa...")
+
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+
+                results = []
+                for idx, company in enumerate(selected_airtable_companies):
+                    fields = company.get("fields", {})
+                    company_name = fields.get("Company Name", "N/A")
+                    company_id = company.get("id")
+                    company_url = fields.get("Home URL", "")
+
+                    status_text.text(f"Procesando {idx+1}/{len(selected_airtable_companies)}: {company_name}")
+                    progress_bar.progress((idx + 1) / len(selected_airtable_companies))
+
+                    result_entry = {
+                        "company_name": company_name,
+                        "company_id": company_id,
+                        "parent_company": None,
+                        "ultimate_parent": None,
+                        "subsidiaries": [],
+                        "success": False,
+                        "error": None,
+                    }
+
+                    try:
+                        structure_result = api.enrich_company(
+                            company_id,
+                            company_name=company_name,
+                            company_url=company_url,
+                            include_financials=False,
+                            include_contacts=False,
+                        )
+
+                        if hasattr(structure_result, "company_info") and structure_result.company_info:
+                            result_entry["success"] = True
+                        elif isinstance(structure_result, dict):
+                            result_entry["success"] = structure_result.get("success", False)
+                            if not result_entry["success"]:
+                                result_entry["error"] = str(structure_result.get("errors", []))
+                        else:
+                            result_entry["error"] = "Resultado no reconocido"
+
+                    except Exception as e:
+                        result_entry["error"] = str(e)
+
+                    results.append(result_entry)
+
+                progress_bar.empty()
+                status_text.empty()
+
+                st.session_state.tab1_enrichment = {"type": "structure", "data": results}
+
+            if t1_btn_bus and has_airtable_selection:
+                st.markdown("---")
+                st.markdown("### 🏢 Gestionando Business Units...")
+
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+
+                results = []
+                for idx, company in enumerate(selected_airtable_companies):
+                    fields = company.get("fields", {})
+                    company_name = fields.get("Company Name", "N/A")
+                    company_id = company.get("id")
+
+                    status_text.text(f"Procesando {idx+1}/{len(selected_airtable_companies)}: {company_name}")
+                    progress_bar.progress((idx + 1) / len(selected_airtable_companies))
+
+                    result_entry = {
+                        "company_name": company_name,
+                        "company_id": company_id,
+                        "bus_created": 0,
+                        "bus_updated": 0,
+                        "bus_list": [],
+                        "success": False,
+                        "error": None,
+                    }
+
+                    try:
+                        bu_result = api.get_or_create_business_units(company_id, company_name)
+                        if isinstance(bu_result, dict):
+                            result_entry["bus_created"] = bu_result.get("created", 0)
+                            result_entry["bus_updated"] = bu_result.get("updated", 0)
+                            result_entry["bus_list"] = bu_result.get("business_units", [])
+                            result_entry["success"] = bu_result.get("success", False)
+                            if not result_entry["success"]:
+                                result_entry["error"] = str(bu_result.get("errors", []))
+                        else:
+                            result_entry["success"] = True
+                            result_entry["bus_created"] = 1
+                    except Exception as e:
+                        result_entry["error"] = str(e)
+
+                    results.append(result_entry)
+
+                progress_bar.empty()
+                status_text.empty()
+
+                st.session_state.tab1_enrichment = {"type": "business_units", "data": results}
+
+            render_enrichment_results("tab1_enrichment", "t1_close_enrichment")
+
 
 # ============================================================================
 # TAB 2: EMPRESAS EN AIRTABLE

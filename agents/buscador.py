@@ -25,7 +25,7 @@ Usage:
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 from difflib import SequenceMatcher
 import uuid
 import re
@@ -51,6 +51,26 @@ settings = get_settings()
 
 # URL verification timeout
 URL_TIMEOUT_SECONDS = 5
+URL_FALLBACK_TIMEOUT_SECONDS = 10
+
+# Domains that are unlikely to be official websites
+NON_OFFICIAL_DOMAINS = {
+    "linkedin.com",
+    "facebook.com",
+    "instagram.com",
+    "twitter.com",
+    "x.com",
+    "crunchbase.com",
+    "wikipedia.org",
+    "bloomberg.com",
+}
+
+# User agent for URL verification
+URL_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
 
 # Similarity threshold for deduplication
 SIMILARITY_THRESHOLD = 0.90
@@ -114,7 +134,6 @@ class CompanyCandidate:
     """A candidate company found during search."""
     name: str
     home_url: Optional[str] = None
-    linkedin_url: Optional[str] = None
     description: Optional[str] = None
     sector: Optional[str] = None
     country: Optional[str] = None
@@ -302,10 +321,9 @@ class BuscadorEmpresas:
                 result.errors.append("No companies found matching criteria")
                 return result
             
-            # Step 2: Verify URLs and refine data
+            # Step 2: Verify URLs
             if verify_urls:
                 self._verify_urls(candidates)
-                self._refine_candidates(candidates, criteria)
                 result.candidates_verified = sum(1 for c in candidates if c.url_verified)
                 
                 logger.info(
@@ -495,11 +513,10 @@ REQUISITOS ESTRICTOS:
 
 Para cada empresa encontrada, proporciona la información en formato JSON:
 {{
-            "companies": [
+    "companies": [
         {{
             "name": "Nombre exacto de la empresa",
             "home_url": "https://www.ejemplo.com",
-            "linkedin_url": "https://www.linkedin.com/company/...",
             "description": "Breve descripción de la actividad",
             "sector": "Sector de actividad",
             "country": "Código de país ISO (ES, IE, PT, DE, etc.)",
@@ -536,11 +553,10 @@ Extract the company information from this text and return as JSON:
 
 Return ONLY valid JSON in this exact format:
 {{
-            "companies": [
+    "companies": [
         {{
             "name": "Company Name",
             "home_url": "https://...",
-            "linkedin_url": "https://www.linkedin.com/company/...",
             "description": "...",
             "sector": "...",
             "country": "ES",
@@ -559,7 +575,6 @@ Return ONLY valid JSON in this exact format:
                 candidate = CompanyCandidate(
                     name=company_data.get("name", "Unknown"),
                     home_url=company_data.get("home_url"),
-                    linkedin_url=company_data.get("linkedin_url"),
                     description=company_data.get("description"),
                     sector=company_data.get("sector"),
                     country=company_data.get("country"),
@@ -586,142 +601,144 @@ Return ONLY valid JSON in this exact format:
             candidates: List of candidates to verify
         """
         for candidate in candidates:
-            verified, final_url = self._verify_single_url(candidate.home_url)
-            candidate.url_verified = verified
-            if final_url:
-                candidate.home_url = final_url
+            candidate.url_verified = False
+            normalized = self._normalize_url(candidate.home_url)
+
+            # First attempt: verify provided URL
+            verified, resolved_url = self._resolve_url(normalized)
+            if not verified:
+                # Fallback: try to find official website using Gemini
+                fallback_url = self._find_official_website(
+                    company_name=candidate.name,
+                    country=candidate.country,
+                    sector=candidate.sector,
+                )
+                verified, resolved_url = self._resolve_url(self._normalize_url(fallback_url))
+
+            if verified and resolved_url:
+                candidate.url_verified = True
+                candidate.home_url = resolved_url
+            else:
+                candidate.url_verified = False
 
     def _normalize_url(self, url: Optional[str]) -> Optional[str]:
-        """Normalize URL for verification."""
+        """Normalize a URL string for verification."""
         if not url:
             return None
-        cleaned = url.strip()
+        cleaned = url.strip().strip(".,;:)")
         if not cleaned:
             return None
         if not cleaned.startswith(("http://", "https://")):
             cleaned = f"https://{cleaned}"
-        return cleaned.rstrip("/")
+        return cleaned
 
-    def _verify_single_url(self, url: Optional[str]) -> tuple[bool, Optional[str]]:
-        """Verify a single URL and return (is_valid, final_url)."""
-        normalized = self._normalize_url(url)
-        if not normalized:
+    def _resolve_url(self, url: Optional[str]) -> tuple[bool, Optional[str]]:
+        """Resolve a URL and return (is_valid, resolved_root_url)."""
+        if not url:
             return False, None
+
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower()
+        if any(domain.endswith(d) for d in NON_OFFICIAL_DOMAINS):
+            return False, None
+
         try:
-            with httpx.Client(timeout=URL_TIMEOUT_SECONDS, follow_redirects=True) as client:
-                response = client.head(normalized)
+            with httpx.Client(
+                timeout=URL_FALLBACK_TIMEOUT_SECONDS,
+                follow_redirects=True,
+                headers={"User-Agent": URL_USER_AGENT},
+            ) as client:
+                response = client.head(url)
+                if response.status_code >= 400 or response.status_code in {405, 429, 403}:
+                    response = client.get(url)
+
                 if response.status_code >= 400:
-                    response = client.get(normalized)
-                is_valid = response.status_code < 400
-                final_url = str(response.url) if is_valid else normalized
-                return is_valid, final_url
+                    return False, None
+
+                final_url = str(response.url)
+                root_url = self._root_url(final_url)
+
+                # Prefer canonical/og:url if present
+                if response.headers.get("content-type", "").startswith("text/html"):
+                    canonical = self._extract_canonical_url(response.text, root_url)
+                    if canonical:
+                        root_url = self._root_url(canonical)
+
+                return True, root_url
         except Exception as e:
-            logger.debug(
-                "url_verification_failed",
-                url=normalized,
-                error=str(e),
-            )
-            return False, normalized
+            logger.debug("url_verification_failed", url=url, error=str(e))
+            return False, None
 
-    def _is_probable_official_url(self, company_name: str, url: Optional[str]) -> bool:
-        """Check whether a URL likely belongs to the company."""
-        if not url or not company_name:
-            return False
-        domain = self._extract_domain(url) or ""
-        if not domain:
-            return False
-        name = re.sub(r"[^\w\s]", " ", company_name.lower())
-        name = re.sub(r"\b(s\.l\.|sl|s\.a\.|sa|ltd|inc|gmbh|bv|srl|plc|llc)\b", "", name)
-        tokens = [t for t in name.split() if len(t) >= 3]
-        if not tokens:
-            return True
-        return any(token in domain for token in tokens)
+    def _root_url(self, url: str) -> str:
+        """Return scheme+netloc for a URL."""
+        parsed = urlparse(url)
+        return f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else url
 
-    def _resolve_official_url(
+    def _extract_canonical_url(self, html: str, base_url: str) -> Optional[str]:
+        """Extract canonical or og:url from HTML."""
+        canonical_match = re.search(
+            r'rel=["\\\']canonical["\\\'][^>]*href=["\\\']([^"\\\']+)["\\\']',
+            html,
+            re.IGNORECASE,
+        )
+        if canonical_match:
+            return urljoin(base_url, canonical_match.group(1))
+
+        og_match = re.search(
+            r'property=["\\\']og:url["\\\'][^>]*content=["\\\']([^"\\\']+)["\\\']',
+            html,
+            re.IGNORECASE,
+        )
+        if og_match:
+            return urljoin(base_url, og_match.group(1))
+
+        return None
+
+    def _find_official_website(
         self,
         company_name: str,
-        country: Optional[str],
-        region: Optional[str],
-    ) -> dict[str, Any]:
-        """Find official website and key metadata for a company."""
-        country_name = self._get_country_name(country) if country else None
-        region_text = f" en {region}" if region else ""
-        location_hint = f"{country_name}{region_text}" if country_name else ""
+        country: Optional[str] = None,
+        sector: Optional[str] = None,
+    ) -> Optional[str]:
+        """Use Gemini search grounding to find the official website."""
+        if not company_name:
+            return None
 
-        prompt = f"""
-Encuentra el sitio web OFICIAL de la empresa "{company_name}" {f"({location_hint})" if location_hint else ""}.
-Devuelve SOLO un JSON con esta estructura:
-{{
-  "website": "https://www.ejemplo.com",
-  "linkedin_url": "https://www.linkedin.com/company/...",
-  "description": "Descripción breve",
-  "sector": "Sector",
-  "country": "{country or ''}",
-  "region": "{region or ''}",
-  "estimated_employees": 100
-}}
-
-REGLAS:
-- Usa SOLO el sitio web oficial (dominio propio).
-- Si hay dudas, devuelve el candidato más probable.
-"""
-        response = self._gemini.search_and_generate(
-            query=prompt,
-            system_prompt=self._system_prompt,
+        country_hint = f" in {country}" if country else ""
+        sector_hint = f" ({sector})" if sector else ""
+        query = (
+            f"Find the official website URL for the company '{company_name}'{country_hint}{sector_hint}. "
+            "Return ONLY the official website domain or URL."
         )
-        result = self._gemini.generate_json(
-            prompt=f"Extrae y devuelve SOLO el JSON:\n\n{response.get('response', '')}",
-        )
-        return result if isinstance(result, dict) else {}
 
-    def _refine_candidates(
-        self,
-        candidates: list[CompanyCandidate],
-        criteria: SearchCriteria,
-    ) -> None:
-        """Improve URLs and metadata using additional verification/search."""
-        for candidate in candidates:
-            needs_url = not candidate.home_url or not candidate.url_verified
-            plausible_url = self._is_probable_official_url(candidate.name, candidate.home_url)
-            needs_profile = not candidate.description or not candidate.sector or not candidate.estimated_employees
-            needs_linkedin = not candidate.linkedin_url
+        try:
+            response = self._gemini.search_and_generate(
+                query=query,
+                system_prompt=(
+                    "Return only the official company website. "
+                    "If multiple results, choose the canonical corporate site."
+                ),
+            )
+            result = self._gemini.generate_json(
+                prompt=(
+                    "Extract the official website as JSON with this structure:\n"
+                    '{"official_website": "https://example.com"}\n\n'
+                    f"Source text:\n{response.get('response', '')}"
+                ),
+            )
+            url = result.get("official_website")
+            if not url:
+                return None
 
-            if not needs_url and plausible_url and not needs_profile and not needs_linkedin:
-                continue
+            parsed = urlparse(url if url.startswith(("http://", "https://")) else f"https://{url}")
+            domain = parsed.netloc.lower()
+            if any(domain.endswith(d) for d in NON_OFFICIAL_DOMAINS):
+                return None
 
-            try:
-                profile = self._resolve_official_url(
-                    company_name=candidate.name,
-                    country=criteria.country,
-                    region=criteria.region,
-                )
-            except Exception as e:
-                logger.debug("url_resolution_failed", company=candidate.name, error=str(e))
-                continue
-
-            website = profile.get("website")
-            linkedin_url = profile.get("linkedin_url")
-            description = profile.get("description")
-            sector = profile.get("sector")
-            region = profile.get("region")
-            employees = profile.get("estimated_employees")
-
-            if website:
-                verified, final_url = self._verify_single_url(website)
-                candidate.url_verified = verified
-                if final_url:
-                    candidate.home_url = final_url
-
-            if linkedin_url and not candidate.linkedin_url:
-                candidate.linkedin_url = linkedin_url
-            if description and not candidate.description:
-                candidate.description = description
-            if sector and not candidate.sector:
-                candidate.sector = sector
-            if region and not candidate.region:
-                candidate.region = region
-            if employees and not candidate.estimated_employees:
-                candidate.estimated_employees = employees
+            return url
+        except Exception as e:
+            logger.debug("official_website_lookup_failed", company=company_name, error=str(e))
+            return None
     
     def _deduplicate(self, candidates: list[CompanyCandidate]) -> None:
         """Check candidates against existing companies in database.
